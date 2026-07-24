@@ -28,6 +28,7 @@ import {
   readConfig,
   readCache,
   persistCache,
+  resolveCacheCwd,
   bumpEditCount,
   rememberFindings,
   dedupeAgainstCache,
@@ -36,6 +37,7 @@ import {
   renderCleanAck,
   renderPendingAck,
   shouldEmitAckForFile,
+  matchConfiguredExtension,
   matchesAnyGlob,
   writeAuditLog,
   suppressionNotice,
@@ -47,9 +49,19 @@ import {
   parseStaticStyleImports,
   coLocatedStylesheets,
   runHook,
+  runStopHook,
+  IMMEDIATE_TIER_RULES,
+  splitFindingsByTier,
+  perEditTieringActive,
+  ADVISORY_RULES,
+  isAdvisoryFinding,
   payload,
   extractFindingIgnoreValue,
+  resolveProjectPlatform,
+  isNativePlatform,
+  normalizeIgnoreValueEntries,
 } from '../skill/scripts/hook-lib.mjs';
+import { normalizeIgnoreValueEntries as normalizeIgnoreValueEntriesCli } from '../cli/lib/impeccable-config.mjs';
 import { detectHtml, detectText } from '../cli/engine/detect-antipatterns.mjs';
 
 function mkTmp() {
@@ -118,6 +130,30 @@ describe('SENSITIVE_PATH / GENERATED_PATH', () => {
       '/x/pkg.lock.json', '/x/.next/server.js', '/x/coverage/report.html',
     ]) {
       assert.ok(GENERATED_PATH.test(p), `expected generated: ${p}`);
+    }
+  });
+
+  it('skips committed build output living outside dist/', () => {
+    // Not every generated artifact lands in dist/. Repos commit browser
+    // bundles and detector copies next to source, and findings against them
+    // are never actionable.
+    for (const p of [
+      '/x/site/public/js/generated/counts.js',
+      '/x/src/generated/schema.ts',
+      '/x/app/generated/api.tsx',
+    ]) {
+      assert.ok(GENERATED_PATH.test(p), `expected generated: ${p}`);
+    }
+  });
+
+  it('does not treat authored paths that merely mention generation as generated', () => {
+    for (const p of [
+      '/x/src/generateReport.ts',
+      '/x/src/generated-utils.ts',
+      '/x/src/components/CodeGenerator.tsx',
+      '/x/src/ui/regenerate-button.jsx',
+    ]) {
+      assert.ok(!GENERATED_PATH.test(p), `unexpected generated: ${p}`);
     }
   });
 });
@@ -218,6 +254,49 @@ describe('readConfig()', () => {
     assert.equal(cfg.enabled, false);
     assert.deepEqual(cfg.ignoreRules, ['side-tab']);
     assert.equal(cfg.limits.maxFindings, 3);
+  });
+
+  it('parses detector.extensions entries and defaults engine to html', () => {
+    fs.mkdirSync(path.join(cwd, '.impeccable'), { recursive: true });
+    fs.writeFileSync(getConfigPath(cwd), JSON.stringify({
+      detector: {
+        extensions: [
+          { ext: '.blade.php' },
+          { ext: '.html.erb', engine: 'html' },
+          { ext: '.d.ts.hbs', engine: 'text' },
+          'twig',
+          { ext: '' },
+          { engine: 'html' },
+          42,
+        ],
+      },
+    }));
+    const cfg = readConfig(cwd);
+    assert.deepEqual(cfg.extensions, [
+      { ext: '.blade.php', engine: 'html' },
+      { ext: '.html.erb', engine: 'html' },
+      { ext: '.d.ts.hbs', engine: 'text' },
+      { ext: '.twig', engine: 'html' },
+    ]);
+  });
+
+  it('lets local-config detector.extensions override the shared engine per ext', () => {
+    fs.mkdirSync(path.join(cwd, '.impeccable'), { recursive: true });
+    fs.writeFileSync(getConfigPath(cwd), JSON.stringify({
+      detector: { extensions: [{ ext: '.blade.php', engine: 'html' }] },
+    }));
+    fs.writeFileSync(getLocalConfigPath(cwd), JSON.stringify({
+      detector: { extensions: [{ ext: '.blade.php', engine: 'text' }, { ext: '.twig' }] },
+    }));
+    const cfg = readConfig(cwd);
+    assert.deepEqual(cfg.extensions, [
+      { ext: '.blade.php', engine: 'text' },
+      { ext: '.twig', engine: 'html' },
+    ]);
+  });
+
+  it('defaults detector.extensions to an empty list', () => {
+    assert.deepEqual(readConfig(cwd).extensions, []);
   });
 
   it('parses the new quiet and auditLog fields from the unified config', () => {
@@ -339,6 +418,39 @@ describe('filterFindings()', () => {
     assert.deepEqual(filtered.map((f) => f.antipattern), ['gradient-text', 'overused-font']);
   });
 
+  it('drops advisory-rule findings by default', () => {
+    const findings = [
+      finding('side-tab', 1),
+      finding('em-dash-overuse', 2),
+      finding('gradient-text', 3),
+    ];
+    const filtered = filterFindings(findings, '', '.html', {
+      ignoreRules: [],
+      limits: DEFAULT_CONFIG.limits,
+    });
+    assert.deepEqual(filtered.map((f) => f.antipattern), ['side-tab', 'gradient-text']);
+  });
+
+  it('keeps advisory-rule findings when advisoryRules is "include"', () => {
+    const findings = [
+      finding('side-tab', 1),
+      finding('em-dash-overuse', 2),
+    ];
+    const filtered = filterFindings(findings, '', '.html', {
+      ignoreRules: [],
+      advisoryRules: 'include',
+      limits: DEFAULT_CONFIG.limits,
+    });
+    assert.deepEqual(filtered.map((f) => f.antipattern), ['side-tab', 'em-dash-overuse']);
+  });
+
+  it('recognizes advisory findings by rule id or explicit flag', () => {
+    assert.ok(ADVISORY_RULES.has('em-dash-overuse'));
+    assert.equal(isAdvisoryFinding(finding('em-dash-overuse', 1)), true);
+    assert.equal(isAdvisoryFinding({ antipattern: 'anything', advisory: true }), true);
+    assert.equal(isAdvisoryFinding(finding('side-tab', 1)), false);
+  });
+
   it('does not treat source comments as hook suppression', () => {
     const content = [
       '/* impeccable: ignore * */',
@@ -372,6 +484,24 @@ describe('filterFindings()', () => {
       limits: DEFAULT_CONFIG.limits,
     });
     assert.deepEqual(filtered.map((f) => `${f.antipattern}:${f.line}`), ['overused-font:2', 'bounce-easing:4', 'side-tab:3']);
+  });
+
+  it('honors a specific-value ignoreValues entry for design-system-font-size', () => {
+    // The rule carries an ignoreValue and the hook's own directive tells the
+    // agent to waive value-specific findings with `hooks ignore-value`, but
+    // font-size was missing from the direct-value rule set, so any waiver
+    // naming an actual size was filtered against an empty extracted value and
+    // silently did nothing. Only the `*` wildcard worked.
+    const findings = [
+      { ...finding('design-system-font-size', 1), ignoreValue: '0.82rem' },
+      { ...finding('design-system-font-size', 2), ignoreValue: '0.9rem' },
+    ];
+    const filtered = filterFindings(findings, '', '.css', {
+      ignoreRules: [],
+      ignoreValues: [{ rule: 'design-system-font-size', value: '0.82rem' }],
+      limits: DEFAULT_CONFIG.limits,
+    });
+    assert.deepEqual(filtered.map((f) => f.ignoreValue), ['0.9rem']);
   });
 
   it('scopes ignoreValues to file globs when files are provided', () => {
@@ -478,6 +608,72 @@ describe('hook-admin.mjs', () => {
     });
   }
 
+  it('refuses an empty --file glob instead of silently writing a project-wide ignore', () => {
+    // `--file=` was dropped by filter(Boolean), so this reported success and
+    // stored an entry with no files: a broader suppression than was asked for.
+    for (const args of [['--file='], ['--file', ''], ['--files=']]) {
+      assert.throws(
+        () => runAdmin(['ignore-value', 'overused-font', 'Inter', ...args]),
+        /requires a non-empty glob/,
+        `empty glob via ${args.join(' ')} must error`,
+      );
+    }
+    // `--file --reason "why"` consumed --reason as the scope and let the reason
+    // text fold into the value: stored value="* why" files=["--reason"], success.
+    assert.throws(
+      () => runAdmin(['ignore-value', 'design-system-font-size', '*', '--file', '--reason', 'why']),
+      /requires a glob, got the flag --reason/,
+      'a following flag is not a glob',
+    );
+    assert.equal(fs.existsSync(path.join(cwd, '.impeccable', 'config.json')), false, 'nothing may be written');
+  });
+
+  it('matches an on-disk scope whose glob order differs from the sorted argv form', () => {
+    // Storage is canonical now, but configs written before that are not. Every key
+    // that hashes `files` must sort or a re-add duplicates the entry.
+    fs.mkdirSync(path.join(cwd, '.impeccable'), { recursive: true });
+    fs.writeFileSync(path.join(cwd, '.impeccable', 'config.json'), JSON.stringify({
+      detector: { ignoreValues: [
+        { rule: 'design-system-font-size', value: '*', files: ['b.css', 'a.css'], createdAt: '2026-01-01T00:00:00.000Z' },
+      ] },
+    }));
+    runAdmin(['ignore-value', 'design-system-font-size', '*', '--file', 'a.css', '--file', 'b.css', '--reason', 're-add']);
+    const cfg = JSON.parse(fs.readFileSync(path.join(cwd, '.impeccable', 'config.json'), 'utf-8'));
+    const entries = cfg.detector.ignoreValues.filter((e) => e.rule === 'design-system-font-size');
+    assert.equal(entries.length, 1, 'an unsorted on-disk scope must match the sorted argv form, not duplicate');
+    assert.equal(entries[0].reason, 're-add', 'the existing entry is the one updated');
+  });
+
+  it('stores a multi-file scope in canonical order so argv order cannot duplicate it', () => {
+    runAdmin(['ignore-value', 'design-system-font-size', '*', '--file', 'b.css', '--file', 'a.css']);
+    runAdmin(['ignore-value', 'design-system-font-size', '*', '--file', 'a.css', '--file', 'b.css']);
+    const cfg = JSON.parse(fs.readFileSync(path.join(cwd, '.impeccable', 'config.json'), 'utf-8'));
+    const entries = cfg.detector.ignoreValues.filter((e) => e.rule === 'design-system-font-size');
+    assert.equal(entries.length, 1, 'the same scope in a different order is one entry, not two');
+    assert.deepEqual(entries[0].files, ['a.css', 'b.css']);
+  });
+
+  it('status shows the file scope of a scoped wildcard ignore', () => {
+    runAdmin(['ignore-value', 'design-system-font-size', '*', '--file', 'src/widget.js']);
+    const out = runAdmin(['status']);
+    // Printing `design-system-font-size=*` bare reads as the project-wide
+    // wildcard this command refuses, which is the opposite of what is on disk.
+    assert.match(out, /design-system-font-size=\*\s*\[src\/widget\.js\]/);
+  });
+
+  it('refuses a bare wildcard and names a project-wide command that actually works', () => {
+    assert.throws(
+      () => runAdmin(['ignore-value', 'design-system-font-size', '*']),
+      (err) => /--file/.test(String(err.stderr)) && /ignore-rule design-system-font-size\./.test(String(err.stderr)),
+    );
+    // ignore-rule overused-font refuses on its own without --all-values, so the
+    // suggestion must carry the flag or it hands the user a second error.
+    assert.throws(
+      () => runAdmin(['ignore-value', 'overused-font', '*']),
+      (err) => /ignore-rule overused-font --all-values/.test(String(err.stderr)),
+    );
+  });
+
   it('ignore-value writes shared config by default without creating local config', () => {
     const out = runAdmin(['ignore-value', 'overused-font', 'Inter', '--reason', 'User confirmed Inter']);
     assert.match(out, /overused-font=inter/);
@@ -515,6 +711,132 @@ describe('hook-admin.mjs', () => {
     const status = runAdmin(['status']);
     assert.match(status, /local file:\s+\.impeccable\/config\.local\.json/);
     assert.match(status, /ignoreValues:\s+overused-font=inter/);
+  });
+
+  // detector.ignoreValues honours a `files` scope, which is the narrowest way to
+  // silence one noisy rule on one file. hook-admin could not write it, so the
+  // only reachable option was ignore-file, which silences every rule for that
+  // file forever.
+  it('ignore-value scopes a wildcard to files via --file', () => {
+    const out = runAdmin([
+      'ignore-value', 'design-system-font-size', '*',
+      '--file', 'src/overlay/widget.js',
+      '--reason', 'Widget builds its own type scale',
+    ]);
+    assert.match(out, /scoped to src\/overlay\/widget\.js/);
+    const shared = JSON.parse(fs.readFileSync(getConfigPath(cwd), 'utf-8')).detector;
+    assert.deepEqual(shared.ignoreValues, [{
+      rule: 'design-system-font-size',
+      value: '*',
+      files: ['src/overlay/widget.js'],
+      createdAt: shared.ignoreValues[0].createdAt,
+      reason: 'Widget builds its own type scale',
+    }]);
+  });
+
+  it('ignore-value accepts --file=, --files= and repeated --file', () => {
+    runAdmin(['ignore-value', 'side-tab', '*', '--file=a.css']);
+    runAdmin(['ignore-value', 'side-tab', '*', '--files=b.css']);
+    runAdmin(['ignore-value', 'low-contrast', '*', '--file', 'c.css', '--file', 'd.css']);
+    const shared = JSON.parse(fs.readFileSync(getConfigPath(cwd), 'utf-8')).detector;
+    assert.deepEqual(
+      shared.ignoreValues.map(({ rule, files }) => ({ rule, files })),
+      [
+        { rule: 'side-tab', files: ['a.css'] },
+        { rule: 'side-tab', files: ['b.css'] },
+        { rule: 'low-contrast', files: ['c.css', 'd.css'] },
+      ],
+      'each distinct file scope is its own entry; a rule+value-only key overwrote them',
+    );
+  });
+
+  it('ignore-value refuses a wildcard with no file scope', () => {
+    assert.throws(
+      () => runAdmin(['ignore-value', 'design-system-font-size', '*']),
+      /Wildcard value ignores must be scoped with --file/,
+      'a bare wildcard is ignore-rule\'s job, not a per-file waiver',
+    );
+    assert.equal(fs.existsSync(getConfigPath(cwd)), false, 'a refused ignore must not write config');
+  });
+
+  it('ignore-value --file requires a glob', () => {
+    assert.throws(
+      () => runAdmin(['ignore-value', 'side-tab', '*', '--file']),
+      /--file requires a glob/,
+    );
+  });
+
+  it('ignore-value rejects an unknown flag instead of folding it into the value', () => {
+    // `--shard` (a typo for --shared) used to store the value "inter --shard",
+    // which matches nothing, while reporting a successful suppression.
+    assert.throws(
+      () => runAdmin(['ignore-value', 'overused-font', 'Inter', '--shard']),
+      /Unknown ignore-value flag: --shard/,
+    );
+    assert.equal(fs.existsSync(getConfigPath(cwd)), false);
+  });
+
+  // Every write runs the entries through normalizeIgnoreValueEntries. Emitting a
+  // different key order than the one on disk rewrote all untouched entries.
+  it('an unrelated edit leaves existing ignoreValues byte-identical', () => {
+    fs.mkdirSync(path.join(cwd, '.impeccable'), { recursive: true });
+    const seeded = {
+      detector: {
+        ignoreRules: [],
+        ignoreFiles: [],
+        ignoreValues: [
+          {
+            rule: 'bounce-easing',
+            value: 'bounce-ball',
+            createdAt: '2026-06-15T04:15:03.164Z',
+            reason: 'Intentional',
+          },
+          {
+            rule: 'design-system-color',
+            value: '*',
+            files: ['site/styles/demo.css'],
+            createdAt: '2026-06-15T23:37:38.170Z',
+            reason: 'Deliberate off-system demo',
+          },
+        ],
+      },
+    };
+    fs.writeFileSync(getConfigPath(cwd), JSON.stringify(seeded, null, 2) + '\n');
+    const before = JSON.parse(fs.readFileSync(getConfigPath(cwd), 'utf-8')).detector.ignoreValues;
+
+    runAdmin(['ignore-file', 'some/other/**']);
+
+    const after = JSON.parse(fs.readFileSync(getConfigPath(cwd), 'utf-8')).detector;
+    assert.deepEqual(after.ignoreFiles, ['some/other/**'], 'the intended change still lands');
+    assert.equal(
+      JSON.stringify(after.ignoreValues),
+      JSON.stringify(before),
+      'untouched ignoreValues must keep their exact key order, or every config diff churns',
+    );
+  });
+
+  // hook-lib.mjs (skill, ships into harness dirs) and cli/lib/impeccable-config.mjs
+  // (CLI + Pages functions) carry independent copies of this normalizer by
+  // necessity. They write the same file, so a key-order drift between them makes
+  // the config churn depending on which tool touched it last.
+  it('both config normalizers emit identical entries', () => {
+    const input = [
+      { rule: 'BOUNCE-EASING', value: 'Bounce-Ball', reason: ' r ', createdAt: '2026-01-01T00:00:00.000Z' },
+      { rule: 'design-system-color', value: '*', files: [' a.css ', 'b.css', 'a.css'], createdAt: '2026-02-02T00:00:00.000Z' },
+      { rule: 'side-tab', value: '*', file: 'legacy.css' },
+      { rule: '', value: 'dropped' },
+    ];
+    assert.equal(
+      JSON.stringify(normalizeIgnoreValueEntries(input)),
+      JSON.stringify(normalizeIgnoreValueEntriesCli(input)),
+      'skill/scripts/hook-lib.mjs and cli/lib/impeccable-config.mjs must agree, key order included',
+    );
+    // And pin the canonical order itself, which is what the config on disk uses.
+    const full = { rule: 'side-tab', value: '*', files: ['a.css'], createdAt: '2026-01-01T00:00:00.000Z', reason: 'r' };
+    assert.deepEqual(
+      Object.keys(normalizeIgnoreValueEntries([full])[0]),
+      ['rule', 'value', 'files', 'createdAt', 'reason'],
+    );
   });
 
   it('a /impeccable hooks edit preserves sibling hook fields (consent, quiet)', () => {
@@ -562,7 +884,10 @@ describe('hook-admin.mjs', () => {
 
     const claude = fs.readFileSync(path.join(cwd, '.claude', 'settings.local.json'), 'utf-8');
     assert.match(claude, /local-hook\.mjs/);
-    assert.equal(claude.split('skills/impeccable/scripts/hook.mjs').length - 1, 1);
+    // One PostToolUse entry plus one Stop entry; the stale pre-existing
+    // impeccable entry must have been stripped, not accumulated.
+    assert.equal(claude.split('skills/impeccable/scripts/hook.mjs').length - 1, 2);
+    assert.match(claude, /"Stop"/);
 
     const codex = fs.readFileSync(path.join(cwd, '.codex', 'hooks.json'), 'utf-8');
     assert.match(codex, /\.agents\/skills\/impeccable\/scripts\/hook\.mjs/);
@@ -868,7 +1193,7 @@ rounded:
     // over the nudge (`renderTemplate` text), so r1 is unchanged from
     // before. r2 is what changed: silent → pending ack.
     const file = writeFixture('src/Card.tsx', 'noop');
-    const det = fakeDetector([finding('side-tab', 1, { name: 'Side-tab' })]);
+    const det = fakeDetector([finding('text-overflow', 1, { name: 'Content overflow' })]);
 
     const r1 = await runHook({ stdinJson: JSON.stringify(eventFor(file)), env: {}, cwd, detector: det });
     assert.equal(r1.exitCode, 0);
@@ -880,14 +1205,14 @@ rounded:
     assert.equal(r2.exitCode, 0);
     assert.ok(r2.stdout.includes(ENVELOPE_PREFIX));
     assert.match(r2.stdout, /Still has 1 finding\(s\) flagged earlier this session/);
-    assert.match(r2.stdout, /side-tab:1/);
+    assert.match(r2.stdout, /text-overflow:1/);
     assert.equal(r2.audit.emitted, true);
     assert.equal(r2.audit.kind, 'pending');
   });
 
   it('handles a GitHub Copilot edit event end-to-end and emits additionalContext', async () => {
     const file = writeFixture('src/Card.tsx', 'noop');
-    const det = fakeDetector([finding('side-tab', 1, { name: 'Side-tab' })]);
+    const det = fakeDetector([finding('gradient-text', 1, { name: 'Gradient text' })]);
     const githubEvent = {
       sessionId: 'gh-1',
       cwd,
@@ -910,7 +1235,7 @@ rounded:
     // apply_patch (raw patch string in toolArgs), which the matcher and runtime
     // must both cover — not just the edit/create tools seen in `copilot -p`.
     const file = writeFixture('src/Card.tsx', 'noop');
-    const det = fakeDetector([finding('side-tab', 1, { name: 'Side-tab' })]);
+    const det = fakeDetector([finding('gradient-text', 1, { name: 'Gradient text' })]);
     const patch = [
       '*** Begin Patch',
       `*** Update File: ${file}`,
@@ -958,20 +1283,20 @@ rounded:
   });
 
   it('still emits findings for plain .ts files', async () => {
-    const file = writeFixture('src/styles.ts', 'export const css = "border-left: 4px solid #7c3aed";');
+    const file = writeFixture('src/styles.ts', 'export const css = "box-shadow: 0 0 24px #7c3aed";');
     const r = await runHook({
       stdinJson: JSON.stringify(eventFor(file)),
       env: {},
       cwd,
-      detector: fakeDetector([finding('side-tab', 1)]),
+      detector: fakeDetector([finding('dark-glow', 1)]),
     });
     assert.match(r.stdout, /Design hook findings requiring review/);
-    assert.match(r.stdout, /side-tab/);
+    assert.match(r.stdout, /dark-glow/);
   });
 
   it('does not emit pending acks for plain .js files', async () => {
     const file = writeFixture('src/build.js', 'export const value = 1;');
-    const det = fakeDetector([finding('side-tab', 1)]);
+    const det = fakeDetector([finding('text-overflow', 1)]);
     const first = await runHook({ stdinJson: JSON.stringify(eventFor(file)), env: {}, cwd, detector: det });
     assert.match(first.stdout, /Design hook findings requiring review/);
 
@@ -998,7 +1323,7 @@ rounded:
     assert.equal(rClean.audit.quiet, true);
 
     // Findings file: still emits.
-    const detFindings = fakeDetector([finding('side-tab', 1)]);
+    const detFindings = fakeDetector([finding('text-overflow', 1)]);
     const rFindings = await runHook({
       stdinJson: JSON.stringify(eventFor(fileB)),
       env: { IMPECCABLE_HOOK_QUIET: '1' }, cwd, detector: detFindings,
@@ -1069,6 +1394,29 @@ rounded:
     const r = await runHook({ stdinJson: JSON.stringify(eventFor(file)), env: {}, cwd, detector: det });
     assert.equal(r.stdout, '');
     assert.equal(r.audit.skipped, 'config-disabled');
+  });
+
+  it('skips the scan when PRODUCT.md declares a native platform', async () => {
+    // The web rule engine has no business flagging React Native screens; the
+    // hook watches .tsx/.ts/.js, which is exactly what a native project is
+    // made of, so the platform field gates the whole scan.
+    for (const platform of ['ios', 'android', 'adaptive']) {
+      writeFixture('PRODUCT.md', `# App\n\n## Register\n\nproduct\n\n## Platform\n\n${platform}\n`);
+      const file = writeFixture('src/Card.tsx', 'noop');
+      const det = fakeDetector([finding('side-tab', 1)]);
+      const r = await runHook({ stdinJson: JSON.stringify(eventFor(file, `native-${platform}`)), env: {}, cwd, detector: det });
+      assert.equal(r.stdout, '', `expected silence for platform ${platform}`);
+      assert.equal(r.audit.skipped, 'native-platform');
+      assert.equal(r.audit.platform, platform);
+    }
+  });
+
+  it('still scans when PRODUCT.md declares web (or has no platform field)', async () => {
+    writeFixture('PRODUCT.md', '# App\n\n## Register\n\nproduct\n\n## Platform\n\nweb\n');
+    const file = writeFixture('src/Card.tsx', 'noop');
+    const det = fakeDetector([finding('text-overflow', 1, { name: 'Content overflow' })]);
+    const r = await runHook({ stdinJson: JSON.stringify(eventFor(file, 'web-platform')), env: {}, cwd, detector: det });
+    assert.match(r.stdout, /Content overflow/);
   });
 
   it('only unlocks design-system detector findings when DESIGN.md exists', async () => {
@@ -1261,7 +1609,7 @@ rounded:
         command: '*** Begin Patch\n*** Update File: src/Card.tsx\n*** End Patch',
       },
     };
-    const det = fakeDetector([finding('side-tab', 1)]);
+    const det = fakeDetector([finding('text-overflow', 1)]);
     const r = await runHook({ stdinJson: JSON.stringify(event), env: {}, cwd, detector: det });
     assert.equal(r.exitCode, 0);
     assert.match(r.stdout, /Design hook findings requiring review/);
@@ -1276,6 +1624,10 @@ rounded:
   });
 
   it('awaits the real async HTML detector before deciding a page is clean', async () => {
+    // The fixture's finding (side-tab) sits in the deferred tier, so restore
+    // the full per-edit rule set for this test via the config override.
+    fs.mkdirSync(path.join(cwd, '.impeccable'), { recursive: true });
+    fs.writeFileSync(getConfigPath(cwd), JSON.stringify({ hook: { perEditRules: 'all' } }));
     const file = writeFixture('index.html', [
       '<!doctype html>',
       '<html><body>',
@@ -1296,6 +1648,10 @@ rounded:
   it('honors an inline impeccable-disable comment so the hook scans the file clean', async () => {
     // The hook runs the same engine as `npx impeccable detect`, so an in-file
     // waiver suppresses hook findings exactly like a config ignore would.
+    // overused-font is deferred-tier; use the perEditRules override so the
+    // per-edit pass surfaces it here.
+    fs.mkdirSync(path.join(cwd, '.impeccable'), { recursive: true });
+    fs.writeFileSync(getConfigPath(cwd), JSON.stringify({ hook: { perEditRules: 'all' } }));
     const flagged = writeFixture('src/Flagged.tsx', 'const css = "font-family: Inter";');
     const flaggedRun = await runHook({
       stdinJson: JSON.stringify(eventFor(flagged)), env: {}, cwd, detector: { detectHtml, detectText },
@@ -1323,6 +1679,452 @@ rounded:
       env: {}, cwd,
     });
     assert.equal(r.audit.skipped, 'file-missing');
+  });
+});
+
+describe('runHook() — cache write gating (issues #344, #305)', () => {
+  // The hook must be a no-op on disk in projects that never earned an
+  // `.impeccable/` footprint: skipped files never dirty the cache, and a
+  // dirty cache is only persisted when there are fresh findings or the
+  // project already opted in (an `.impeccable/` dir exists).
+  let cwd;
+  beforeEach(() => { cwd = mkTmp(); });
+  afterEach(() => fs.rmSync(cwd, { recursive: true, force: true }));
+
+  function eventFor(file, sessionId = 'gate-sid') {
+    return {
+      session_id: sessionId,
+      cwd,
+      hook_event_name: 'PostToolUse',
+      tool_name: 'Edit',
+      tool_input: { file_path: file },
+    };
+  }
+
+  function write(rel, body, base = cwd) {
+    const abs = path.join(base, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, body);
+    return abs;
+  }
+
+  it('non-UI edit (.md) does not create .impeccable/', async () => {
+    const file = write('notes/todo.md', '# notes');
+    const r = await runHook({
+      stdinJson: JSON.stringify(eventFor(file)),
+      env: {}, cwd, detector: fakeDetector([finding('side-tab', 1)]),
+    });
+    assert.equal(r.audit.skipped, 'extension');
+    assert.ok(!fs.existsSync(path.join(cwd, '.impeccable')), '.impeccable should not exist');
+  });
+
+  it('clean UI edit in a project with no footprint does not create .impeccable/, still acks', async () => {
+    const file = write('src/Card.tsx', 'noop');
+    const r = await runHook({
+      stdinJson: JSON.stringify(eventFor(file)),
+      env: {}, cwd, detector: fakeDetector([]),
+    });
+    assert.match(r.stdout, /No deterministic design-quality issues found/);
+    assert.ok(!fs.existsSync(path.join(cwd, '.impeccable')), '.impeccable should not exist');
+  });
+
+  it('detector-missing path does not create .impeccable/', async () => {
+    const file = write('src/Card.tsx', 'noop');
+    const r = await runHook({
+      stdinJson: JSON.stringify(eventFor(file)),
+      env: {}, cwd, detector: {},
+    });
+    assert.equal(r.audit.skipped, 'detector-missing');
+    assert.ok(!fs.existsSync(path.join(cwd, '.impeccable')), '.impeccable should not exist');
+  });
+
+  it('fresh findings create the cache, and dedup works on the next run', async () => {
+    const file = write('src/Card.tsx', 'noop');
+    const det = fakeDetector([finding('text-overflow', 1)]);
+    const first = await runHook({ stdinJson: JSON.stringify(eventFor(file)), env: {}, cwd, detector: det });
+    assert.match(first.stdout, /Design hook findings requiring review/);
+    assert.ok(fs.existsSync(path.join(cwd, '.impeccable', 'hook.cache.json')), 'cache should exist');
+
+    const second = await runHook({ stdinJson: JSON.stringify(eventFor(file)), env: {}, cwd, detector: det });
+    assert.doesNotMatch(second.stdout, /Design hook findings requiring review/);
+    assert.match(second.stdout, /flagged earlier this session/);
+  });
+
+  it('clean UI edit in an opted-in project (existing .impeccable/) still persists editCount', async () => {
+    fs.mkdirSync(path.join(cwd, '.impeccable'), { recursive: true });
+    const file = write('src/Card.tsx', 'noop');
+    await runHook({ stdinJson: JSON.stringify(eventFor(file)), env: {}, cwd, detector: fakeDetector([]) });
+
+    const cache = readCache(cwd);
+    assert.equal(cache.sessions['gate-sid'].files[file].editCount, 1);
+  });
+
+  it('umbrella launch keys the cache to the edited file\'s project root', async () => {
+    // cwd is the umbrella: no .git / package.json / .impeccable of its own.
+    write('app/package.json', '{"name":"child"}');
+    const file = write('app/src/Card.tsx', 'noop');
+    const child = path.join(cwd, 'app');
+    const r = await runHook({
+      stdinJson: JSON.stringify(eventFor(file)),
+      env: {}, cwd, detector: fakeDetector([finding('text-overflow', 1)]),
+    });
+    assert.match(r.stdout, /Design hook findings requiring review/);
+    assert.equal(r.audit.cwd, child);
+    assert.ok(fs.existsSync(path.join(child, '.impeccable', 'hook.cache.json')), 'cache should land in the child project');
+    assert.ok(!fs.existsSync(path.join(cwd, '.impeccable')), 'umbrella root should stay clean');
+  });
+});
+
+describe('runHook() — oversized files', () => {
+  let cwd;
+  beforeEach(() => {
+    cwd = mkTmp();
+    fs.mkdirSync(path.join(cwd, '.impeccable'), { recursive: true });
+  });
+  afterEach(() => fs.rmSync(cwd, { recursive: true, force: true }));
+
+  const event = (file) => JSON.stringify({
+    session_id: 'sid-1', cwd, hook_event_name: 'PostToolUse',
+    tool_name: 'Edit', tool_input: { file_path: file },
+  });
+
+  it('skips a file past the size ceiling, since a huge single file is a bundle', async () => {
+    const file = path.join(cwd, 'bundle.js');
+    fs.writeFileSync(file, `/* ${'x'.repeat(200 * 1024)} */`);
+    const r = await runHook({
+      stdinJson: event(file), env: {}, cwd,
+      detector: fakeDetector([finding('side-tab', 1, { name: 'Side-tab' })]),
+    });
+    assert.ok(!r.audit.emitted);
+    assert.equal(r.audit.skipped, 'too-large');
+  });
+
+  it('still scans a large but plausibly authored stylesheet', async () => {
+    const file = path.join(cwd, 'main.css');
+    fs.writeFileSync(file, `/* ${'x'.repeat(90 * 1024)} */`);
+    const r = await runHook({
+      stdinJson: event(file), env: {}, cwd,
+      detector: fakeDetector([finding('side-tab', 1, { name: 'Side-tab' })]),
+    });
+    assert.equal(r.audit.emitted, true);
+  });
+
+  // `bytes` describes the file that was skipped. It must never ride along on an
+  // audit entry whose `file` is something else, in either scan order, and must
+  // survive the early-continue paths that sit above the size check.
+  function patchEvent(...files) {
+    return JSON.stringify({
+      session_id: `sid-${files.length}-${files[0]}`, cwd,
+      hook_event_name: 'PostToolUse', tool_name: 'apply_patch',
+      tool_input: {
+        command: `*** Begin Patch\n${files.map(f => `*** Update File: ${f}`).join('\n')}\n*** End Patch`,
+      },
+    });
+  }
+
+  it('does not leak a skipped file\'s byte count when the bundle is scanned first', async () => {
+    const big = path.join(cwd, 'bundle.js');
+    const small = path.join(cwd, 'a.css');
+    fs.writeFileSync(big, `/* ${'x'.repeat(200 * 1024)} */`);
+    fs.writeFileSync(small, 'noop');
+    const r = await runHook({
+      stdinJson: patchEvent(big, small), env: {}, cwd,
+      detector: fakeDetector([finding('side-tab', 1, { name: 'Side-tab' })]),
+    });
+    assert.match(r.stdout, /a\.css/);
+    assert.equal(r.audit.bytes, undefined, 'bytes belongs to the skipped file, not this one');
+  });
+
+  it('does not leak a skipped file\'s byte count when the bundle is scanned last', async () => {
+    const small = path.join(cwd, 'a.css');
+    const big = path.join(cwd, 'bundle.js');
+    fs.writeFileSync(small, 'noop');
+    fs.writeFileSync(big, `/* ${'x'.repeat(200 * 1024)} */`);
+    const r = await runHook({
+      stdinJson: patchEvent(small, big), env: {}, cwd,
+      detector: fakeDetector([finding('side-tab', 1, { name: 'Side-tab' })]),
+    });
+    assert.match(r.stdout, /a\.css/);
+    assert.equal(r.audit.bytes, undefined, 'the emitted file is not the oversized one');
+  });
+
+  it('does not leak a byte count past an early-continue target', async () => {
+    // `generated` is checked before the size gate, so a later generated target
+    // returns without ever reaching the point where bytes would be cleared.
+    const big = path.join(cwd, 'bundle.js');
+    const gen = path.join(cwd, 'dist', 'Card.tsx');
+    fs.writeFileSync(big, `/* ${'x'.repeat(200 * 1024)} */`);
+    fs.mkdirSync(path.dirname(gen), { recursive: true });
+    fs.writeFileSync(gen, 'noop');
+    const r = await runHook({
+      stdinJson: patchEvent(big, gen), env: {}, cwd,
+      detector: fakeDetector([finding('side-tab', 1, { name: 'Side-tab' })]),
+    });
+    assert.ok(!r.audit.emitted);
+    assert.equal(r.audit.bytes, undefined, 'bytes must not describe a different file');
+  });
+
+  it('still records the byte count when the oversized file is the outcome', async () => {
+    const big = path.join(cwd, 'bundle.js');
+    fs.writeFileSync(big, `/* ${'x'.repeat(200 * 1024)} */`);
+    const r = await runHook({
+      stdinJson: patchEvent(big), env: {}, cwd,
+      detector: fakeDetector([finding('side-tab', 1, { name: 'Side-tab' })]),
+    });
+    assert.equal(r.audit.skipped, 'too-large');
+    assert.ok(r.audit.bytes > 200 * 1024, 'the skip reason should still carry its size');
+  });
+
+  it('honors a configured limits.maxFileBytes', async () => {
+    fs.writeFileSync(path.join(cwd, '.impeccable', 'config.json'), JSON.stringify({
+      hook: { limits: { maxFileBytes: 1024 } },
+    }));
+    const file = path.join(cwd, 'small.css');
+    fs.writeFileSync(file, `/* ${'x'.repeat(4096)} */`);
+    const r = await runHook({
+      stdinJson: event(file), env: {}, cwd,
+      detector: fakeDetector([finding('side-tab', 1, { name: 'Side-tab' })]),
+    });
+    assert.equal(r.audit.skipped, 'too-large');
+  });
+});
+
+describe('runHook() — the session cache tracks the current scan', () => {
+  let cwd;
+  beforeEach(() => {
+    cwd = mkTmp();
+    fs.mkdirSync(path.join(cwd, '.impeccable'), { recursive: true });
+  });
+  afterEach(() => fs.rmSync(cwd, { recursive: true, force: true }));
+
+  function eventFor(file, sessionId = 'sid-1') {
+    return {
+      session_id: sessionId,
+      cwd,
+      hook_event_name: 'PostToolUse',
+      tool_name: 'Edit',
+      tool_input: { file_path: file },
+    };
+  }
+
+  // A detector whose findings change between runs, so the cache can be
+  // observed as the file is progressively fixed.
+  function mutableDetector(initial = []) {
+    let current = initial;
+    return {
+      set(next) { current = next; },
+      detectText: () => current.slice(),
+      detectHtml: () => current.slice(),
+    };
+  }
+
+  // An immediate-tier rule, so the per-edit pass reports it rather than
+  // deferring it to the Stop deep pass. These cases are about cache
+  // bookkeeping, not tiering.
+  function fontFinding(line, value) {
+    return { ...finding('design-system-font', line, { name: 'Off-system font' }), ignoreValue: value };
+  }
+
+  const run = (file, det) => runHook({ stdinJson: JSON.stringify(eventFor(file)), env: {}, cwd, detector: det });
+
+  it('counts the current scan in the pending ack, not the session history', async () => {
+    const file = path.join(cwd, 'a.css');
+    fs.writeFileSync(file, 'noop');
+    const det = mutableDetector([
+      fontFinding(1, 'inter'), fontFinding(2, 'roboto'), fontFinding(3, 'geist'),
+    ]);
+
+    const r1 = await run(file, det);
+    assert.match(r1.stdout, /\(3 issue\(s\)\)/);
+
+    // Fix two of the three. The pending ack must not keep naming them.
+    det.set([fontFinding(1, 'inter')]);
+    const r2 = await run(file, det);
+    assert.equal(r2.audit.kind, 'pending');
+    assert.match(r2.stdout, /Still has 1 finding\(s\)/);
+    assert.match(r2.stdout, /design-system-font:1:inter/);
+    assert.ok(!r2.stdout.includes('roboto'), 'must not name a finding that was fixed');
+    assert.ok(!r2.stdout.includes('geist'), 'must not name a finding that was fixed');
+  });
+
+  it('reports a reintroduced finding as fresh instead of swallowing it', async () => {
+    const file = path.join(cwd, 'a.css');
+    fs.writeFileSync(file, 'noop');
+    const det = mutableDetector([fontFinding(1, 'inter')]);
+
+    const r1 = await run(file, det);
+    assert.match(r1.stdout, /Design hook findings requiring review/);
+
+    // Fixed: the hook goes clean and must forget the finding.
+    det.set([]);
+    const r2 = await run(file, det);
+    assert.equal(r2.audit.kind, 'clean');
+
+    // Reintroduced: this is a regression and has to surface as fresh, not be
+    // deduped against a stale memory of the same key.
+    det.set([fontFinding(1, 'inter')]);
+    const r3 = await run(file, det);
+    assert.equal(r3.audit.emitted, true);
+    assert.match(r3.stdout, /Design hook findings requiring review/, 'a reintroduced finding must fire again');
+  });
+
+  it('still dedupes an unchanged finding within a session', async () => {
+    // Guard against over-correcting: forgetting fixed findings must not turn
+    // every repeat edit back into a full findings dump.
+    const file = path.join(cwd, 'a.css');
+    fs.writeFileSync(file, 'noop');
+    const det = mutableDetector([fontFinding(1, 'inter')]);
+
+    await run(file, det);
+    const r2 = await run(file, det);
+    assert.equal(r2.audit.kind, 'pending');
+    assert.match(r2.stdout, /Still has 1 finding\(s\)/);
+  });
+});
+
+describe('runHook() — clean-ack noise', () => {
+  let cwd;
+  beforeEach(() => {
+    cwd = mkTmp();
+    fs.mkdirSync(path.join(cwd, '.impeccable'), { recursive: true });
+  });
+  afterEach(() => fs.rmSync(cwd, { recursive: true, force: true }));
+
+  const event = (file, sessionId = 'sid-1') => JSON.stringify({
+    session_id: sessionId, cwd, hook_event_name: 'PostToolUse',
+    tool_name: 'Edit', tool_input: { file_path: file },
+  });
+
+  it('emits the clean ack once per file per session, then stays silent', async () => {
+    const a = path.join(cwd, 'a.css');
+    const b = path.join(cwd, 'b.css');
+    fs.writeFileSync(a, 'noop');
+    fs.writeFileSync(b, 'noop');
+    const det = fakeDetector([]);
+
+    const r1 = await runHook({ stdinJson: event(a), env: {}, cwd, detector: det });
+    assert.equal(r1.audit.kind, 'clean', 'first clean scan of a file still acks');
+
+    const r2 = await runHook({ stdinJson: event(a), env: {}, cwd, detector: det });
+    assert.ok(!r2.audit.emitted, 'repeat clean scans of the same file stay silent');
+    assert.equal(r2.audit.skipped, 'clean-ack-deduped');
+    assert.equal(r2.stdout, '');
+
+    // A different file gets its own first ack.
+    const r3 = await runHook({ stdinJson: event(b), env: {}, cwd, detector: det });
+    assert.equal(r3.audit.kind, 'clean');
+
+    // A new session starts over, since the steer is per-session context.
+    const r4 = await runHook({ stdinJson: event(a, 'sid-2'), env: {}, cwd, detector: det });
+    assert.equal(r4.audit.kind, 'clean');
+  });
+
+  it('picks a not-yet-acked file when an earlier target was already acked', async () => {
+    // A multi-file event (apply_patch, MultiEdit) must not lose the ack for a
+    // file the session has never acked just because an earlier target in the
+    // same run was already deduped.
+    const a = path.join(cwd, 'a.css');
+    const b = path.join(cwd, 'b.css');
+    fs.writeFileSync(a, 'noop');
+    fs.writeFileSync(b, 'noop');
+    const det = fakeDetector([]);
+
+    // Ack a on its own first.
+    const r1 = await runHook({ stdinJson: event(a), env: {}, cwd, detector: det });
+    assert.equal(r1.audit.kind, 'clean');
+
+    // Now touch a and b together. a is spent; b has never been acked.
+    const multi = JSON.stringify({
+      session_id: 'sid-1', cwd, hook_event_name: 'PostToolUse', tool_name: 'apply_patch',
+      tool_input: {
+        command: `*** Begin Patch\n*** Update File: ${a}\n*** Update File: ${b}\n*** End Patch`,
+      },
+    });
+    const r2 = await runHook({ stdinJson: multi, env: {}, cwd, detector: det });
+    assert.equal(r2.audit.kind, 'clean', 'b has never been acked and should win');
+    assert.match(r2.stdout, /b\.css/);
+  });
+
+  it('reports non-ui-ack when the winner was not ack-eligible, even after a dedupe', async () => {
+    // Mixed multi-target run: one UI file whose ack is already spent, plus a
+    // non-UI file. Nothing is emitted either way, but the audit reason must
+    // describe the winner rather than the earlier dedupe.
+    const css = path.join(cwd, 'a.css');
+    const ts = path.join(cwd, 'b.ts');
+    fs.writeFileSync(css, 'noop');
+    fs.writeFileSync(ts, 'export const a = 1;');
+    const det = fakeDetector([]);
+
+    await runHook({ stdinJson: event(css), env: {}, cwd, detector: det });
+
+    const multi = JSON.stringify({
+      session_id: 'sid-1', cwd, hook_event_name: 'PostToolUse', tool_name: 'apply_patch',
+      tool_input: {
+        command: `*** Begin Patch\n*** Update File: ${css}\n*** Update File: ${ts}\n*** End Patch`,
+      },
+    });
+    const r = await runHook({ stdinJson: multi, env: {}, cwd, detector: det });
+    assert.ok(!r.audit.emitted);
+    assert.equal(r.audit.skipped, 'non-ui-ack');
+  });
+
+  it('does not spend the clean ack while quiet mode is suppressing output', async () => {
+    // Quiet emits nothing, so it must not consume the once-per-session ack and
+    // leave a later non-quiet run silent.
+    const file = path.join(cwd, 'a.css');
+    fs.writeFileSync(file, 'noop');
+    const det = fakeDetector([]);
+
+    const quiet = await runHook({ stdinJson: event(file), env: { IMPECCABLE_HOOK_QUIET: '1' }, cwd, detector: det });
+    assert.ok(!quiet.audit.emitted);
+
+    const loud = await runHook({ stdinJson: event(file), env: {}, cwd, detector: det });
+    assert.equal(loud.audit.kind, 'clean', 'the ack must survive a quiet run');
+  });
+
+  it('keeps re-nudging with the pending ack, which is the informative one', async () => {
+    const file = path.join(cwd, 'a.css');
+    fs.writeFileSync(file, 'noop');
+    const det = fakeDetector([finding('gradient-text', 1, { name: 'Gradient text' })]);
+
+    await runHook({ stdinJson: event(file), env: {}, cwd, detector: det });
+    const r2 = await runHook({ stdinJson: event(file), env: {}, cwd, detector: det });
+    const r3 = await runHook({ stdinJson: event(file), env: {}, cwd, detector: det });
+    assert.equal(r2.audit.kind, 'pending');
+    assert.equal(r3.audit.kind, 'pending', 'the unresolved-finding nudge must not be deduped away');
+  });
+});
+
+describe('resolveCacheCwd()', () => {
+  let cwd;
+  beforeEach(() => { cwd = mkTmp(); });
+  afterEach(() => fs.rmSync(cwd, { recursive: true, force: true }));
+
+  it('keeps the session cwd when it already looks like a project root', () => {
+    for (const marker of ['.git', '.impeccable']) {
+      const dir = path.join(cwd, `root-${marker}`);
+      fs.mkdirSync(path.join(dir, marker), { recursive: true });
+      const file = path.join(dir, 'nested', 'app', 'src', 'Card.tsx');
+      assert.equal(resolveCacheCwd(file, dir), dir);
+    }
+    const pkgDir = path.join(cwd, 'root-pkg');
+    fs.mkdirSync(pkgDir, { recursive: true });
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), '{}');
+    assert.equal(resolveCacheCwd(path.join(pkgDir, 'src', 'Card.tsx'), pkgDir), pkgDir);
+  });
+
+  it('climbs to the nearest marker root when the session cwd is a bare umbrella', () => {
+    const child = path.join(cwd, 'app');
+    fs.mkdirSync(path.join(child, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(child, 'package.json'), '{}');
+    assert.equal(resolveCacheCwd(path.join(child, 'src', 'Card.tsx'), cwd), child);
+  });
+
+  it('falls back to the session cwd when no marker is found or the path is unsafe', () => {
+    const file = path.join(cwd, 'app', 'src', 'Card.tsx');
+    assert.equal(resolveCacheCwd(file, cwd), cwd);
+    assert.equal(resolveCacheCwd('', cwd), cwd);
+    assert.equal(resolveCacheCwd(`${cwd}/../etc/Card.tsx`, cwd), cwd);
   });
 });
 
@@ -1354,6 +2156,75 @@ describe('ALLOWED_EXTS', () => {
       assert.ok(!ACK_EXTS.has(ext), `unexpected ack extension: ${ext}`);
       assert.equal(shouldEmitAckForFile(`/x/src/tool${ext}`), false);
     }
+  });
+
+  it('acks configured html-engine extensions but not text-engine ones', () => {
+    const config = {
+      extensions: [
+        { ext: '.blade.php', engine: 'html' },
+        { ext: '.d.ts.hbs', engine: 'text' },
+      ],
+    };
+    assert.equal(shouldEmitAckForFile('/x/views/card.blade.php', config), true);
+    assert.equal(shouldEmitAckForFile('/x/templates/types.d.ts.hbs', config), false);
+    assert.equal(shouldEmitAckForFile('/x/views/card.blade.php'), false);
+  });
+});
+
+describe('matchConfiguredExtension()', () => {
+  const extensions = [
+    { ext: '.blade.php', engine: 'html' },
+    { ext: '.html.erb', engine: 'html' },
+    { ext: '.twig', engine: 'html' },
+  ];
+
+  it('matches double extensions against the end of the filename', () => {
+    assert.deepEqual(
+      matchConfiguredExtension('/app/resources/views/Card.blade.php', extensions),
+      { ext: '.blade.php', engine: 'html' },
+    );
+    assert.deepEqual(
+      matchConfiguredExtension('app/views/users/show.html.erb', extensions),
+      { ext: '.html.erb', engine: 'html' },
+    );
+    assert.deepEqual(
+      matchConfiguredExtension('/templates/base.twig', extensions),
+      { ext: '.twig', engine: 'html' },
+    );
+  });
+
+  it('is case-insensitive on the filename', () => {
+    assert.ok(matchConfiguredExtension('/views/Card.BLADE.PHP', extensions));
+  });
+
+  it('prefers the longest matching suffix regardless of config order', () => {
+    const overlapping = [
+      { ext: '.php', engine: 'text' },
+      { ext: '.blade.php', engine: 'html' },
+    ];
+    assert.deepEqual(
+      matchConfiguredExtension('/views/card.blade.php', overlapping),
+      { ext: '.blade.php', engine: 'html' },
+    );
+    assert.deepEqual(
+      matchConfiguredExtension('/views/card.blade.php', overlapping.slice().reverse()),
+      { ext: '.blade.php', engine: 'html' },
+    );
+    assert.deepEqual(
+      matchConfiguredExtension('/app/Controller.php', overlapping),
+      { ext: '.php', engine: 'text' },
+    );
+  });
+
+  it('does not match unrelated files or bare dotfile-like names', () => {
+    assert.equal(matchConfiguredExtension('/app/Http/Controller.php', extensions), null);
+    assert.equal(matchConfiguredExtension('/views/.blade.php', extensions), null);
+    assert.equal(matchConfiguredExtension('/src/Card.tsx', extensions), null);
+  });
+
+  it('returns null for empty or missing config', () => {
+    assert.equal(matchConfiguredExtension('/views/card.blade.php', []), null);
+    assert.equal(matchConfiguredExtension('/views/card.blade.php', undefined), null);
   });
 });
 
@@ -1601,10 +2472,10 @@ describe('runHook() — co-located stylesheet scan', () => {
 
   it('flags slop in styles.css when only App.jsx was edited', async () => {
     const app = write('src/App.jsx', 'export default function App() { return <main className="x" />; }');
-    write('src/styles.css', "body { font-family: 'Inter', sans-serif; }");
+    write('src/styles.css', 'h1 { background-clip: text; color: transparent; }');
     const det = {
       detectText: (content, filePath) => (
-        filePath.endsWith('.css') ? [finding('overused-font', 8)] : []
+        filePath.endsWith('.css') ? [finding('gradient-text', 8)] : []
       ),
       detectHtml: () => [],
     };
@@ -1626,10 +2497,10 @@ describe('runHook() — co-located stylesheet scan', () => {
 
   it('flags slop in co-located .sass when only App.jsx was edited', async () => {
     const app = write('src/App.jsx', 'export default function App() { return <main className="x" />; }');
-    write('src/styles.sass', ".card\n  border-left: 4px solid #3b82f6");
+    write('src/styles.sass', ".card\n  box-shadow: 0 0 24px #3b82f6");
     const det = {
       detectText: (content, filePath) => (
-        filePath.endsWith('.sass') ? [finding('side-tab', 2)] : []
+        filePath.endsWith('.sass') ? [finding('dark-glow', 2)] : []
       ),
       detectHtml: () => [],
     };
@@ -1650,14 +2521,14 @@ describe('runHook() — co-located stylesheet scan', () => {
   });
 
   it('emits fresh findings for every file scanned in the same hook run', async () => {
-    const app = write('src/App.jsx', 'export default function App() { return <main className="border-l-4 border-blue-500" />; }');
-    const styles = write('src/styles.css', "body { font-family: 'Inter', sans-serif; }");
+    const app = write('src/App.jsx', 'export default function App() { return <main className="overflow-hidden" />; }');
+    const styles = write('src/styles.css', 'h1 { background-clip: text; color: transparent; }');
     const seen = [];
     const det = {
       detectText: (content, filePath) => {
         seen.push(filePath);
-        if (filePath.endsWith('App.jsx')) return [finding('side-tab', 1)];
-        if (filePath.endsWith('styles.css')) return [finding('overused-font', 1)];
+        if (filePath.endsWith('App.jsx')) return [finding('text-overflow', 1)];
+        if (filePath.endsWith('styles.css')) return [finding('gradient-text', 1)];
         return [];
       },
       detectHtml: () => [],
@@ -1679,23 +2550,23 @@ describe('runHook() — co-located stylesheet scan', () => {
     assert.match(r.stdout, /Design hook findings requiring review/);
     assert.match(r.stdout, /App\.jsx/);
     assert.match(r.stdout, /styles\.css/);
-    assert.match(r.stdout, /side-tab/);
-    assert.match(r.stdout, /overused-font/);
+    assert.match(r.stdout, /text-overflow/);
+    assert.match(r.stdout, /gradient-text/);
     assert.ok(seen.includes(app), 'primary file should be scanned');
     assert.ok(seen.includes(styles), 'co-located stylesheet should still be scanned');
     assert.equal(r.emission.groups.length, 2);
     const cache = readCache(cwd);
     const files = cache.sessions['co-scan-fresh-primary'].files;
-    assert.deepEqual(files[app].findings, ['side-tab:1']);
-    assert.deepEqual(files[styles].findings, ['overused-font:1']);
+    assert.deepEqual(files[app].findings, ['text-overflow:1']);
+    assert.deepEqual(files[styles].findings, ['gradient-text:1']);
   });
 
   it('does not bump edit count for passively co-scanned stylesheets', async () => {
     const app = write('src/App.jsx', 'export default function App() { return <main className="x" />; }');
-    const styles = write('src/styles.css', "body { font-family: 'Inter', sans-serif; }");
+    const styles = write('src/styles.css', 'h1 { background-clip: text; color: transparent; }');
     const det = {
       detectText: (content, filePath) => (
-        filePath.endsWith('styles.css') ? [finding('overused-font', 1)] : []
+        filePath.endsWith('styles.css') ? [finding('gradient-text', 1)] : []
       ),
       detectHtml: () => [],
     };
@@ -1773,6 +2644,116 @@ describe('runHook() — events without file_path', () => {
   });
 });
 
+describe('runHook() — configured template extensions (issue #316)', () => {
+  let cwd;
+  beforeEach(() => { cwd = mkTmp(); });
+  afterEach(() => fs.rmSync(cwd, { recursive: true, force: true }));
+
+  function eventFor(file) {
+    return {
+      session_id: 'sid-ext',
+      cwd,
+      hook_event_name: 'PostToolUse',
+      tool_name: 'Edit',
+      tool_input: { file_path: file },
+    };
+  }
+
+  function writeFixture(rel, body) {
+    const abs = path.join(cwd, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, body);
+    return abs;
+  }
+
+  function writeExtensionsConfig(extensions) {
+    fs.mkdirSync(path.join(cwd, '.impeccable'), { recursive: true });
+    fs.writeFileSync(getConfigPath(cwd), JSON.stringify({ detector: { extensions } }));
+  }
+
+  function recordingDetector(findings = []) {
+    const calls = { html: [], text: [] };
+    return {
+      calls,
+      detectHtml: (filePath) => { calls.html.push(filePath); return findings; },
+      detectText: (_content, filePath) => { calls.text.push(filePath); return findings; },
+    };
+  }
+
+  it('skips .blade.php with no config — the issue #316 repro', async () => {
+    const file = writeFixture('resources/views/card.blade.php', '<div class="bg-gradient-to-r">Hi</div>');
+    const det = recordingDetector([finding('gradient-text', 1)]);
+    const r = await runHook({ stdinJson: JSON.stringify(eventFor(file)), env: {}, cwd, detector: det });
+    assert.equal(r.stdout, '');
+    assert.equal(r.audit.skipped, 'extension');
+    assert.equal(det.calls.html.length + det.calls.text.length, 0);
+  });
+
+  it('scans a configured .blade.php through the html engine and emits findings', async () => {
+    writeExtensionsConfig([{ ext: '.blade.php' }]);
+    const file = writeFixture('resources/views/card.blade.php', '<div class="bg-gradient-to-r">Hi</div>');
+    const det = recordingDetector([finding('gradient-text', 1, { name: 'Gradient text' })]);
+    const r = await runHook({ stdinJson: JSON.stringify(eventFor(file)), env: {}, cwd, detector: det });
+    assert.match(r.stdout, /Design hook findings requiring review/);
+    assert.match(r.stdout, /gradient-text/);
+    assert.equal(r.audit.emitted, true);
+    assert.equal(r.audit.ext, '.blade.php');
+    assert.deepEqual(det.calls.html, [file]);
+    assert.deepEqual(det.calls.text, []);
+  });
+
+  it('routes an engine:text entry through detectText instead', async () => {
+    writeExtensionsConfig([{ ext: '.blade.php', engine: 'text' }]);
+    const file = writeFixture('resources/views/card.blade.php', '<div>Hi</div>');
+    const det = recordingDetector([finding('text-overflow', 1)]);
+    const r = await runHook({ stdinJson: JSON.stringify(eventFor(file)), env: {}, cwd, detector: det });
+    assert.match(r.stdout, /text-overflow/);
+    assert.deepEqual(det.calls.text, [file]);
+    assert.deepEqual(det.calls.html, []);
+  });
+
+  it('emits a clean ack for configured html-engine files, stays quiet for text-engine ones', async () => {
+    writeExtensionsConfig([
+      { ext: '.blade.php' },
+      { ext: '.d.ts.hbs', engine: 'text' },
+    ]);
+    const blade = writeFixture('resources/views/clean.blade.php', '<div>Hi</div>');
+    const rBlade = await runHook({ stdinJson: JSON.stringify(eventFor(blade)), env: {}, cwd, detector: recordingDetector([]) });
+    assert.match(rBlade.stdout, /No deterministic design-quality issues found/);
+    assert.equal(rBlade.audit.kind, 'clean');
+
+    const hbs = writeFixture('templates/types.d.ts.hbs', 'export type X = {{name}};');
+    const rHbs = await runHook({ stdinJson: JSON.stringify(eventFor(hbs)), env: {}, cwd, detector: recordingDetector([]) });
+    assert.equal(rHbs.stdout, '');
+    assert.equal(rHbs.audit.skipped, 'non-ui-ack');
+  });
+});
+
+describe('resolveProjectPlatform() / isNativePlatform()', () => {
+  let cwd;
+  beforeEach(() => { cwd = mkTmp(); });
+  afterEach(() => fs.rmSync(cwd, { recursive: true, force: true }));
+
+  it('reads the platform from PRODUCT.md via the same resolution the skill uses', () => {
+    fs.writeFileSync(path.join(cwd, 'PRODUCT.md'), '# App\n\n## Platform\n\nios\n');
+    assert.equal(resolveProjectPlatform(cwd), 'ios');
+  });
+
+  it('returns null when PRODUCT.md is absent or platform-less', () => {
+    assert.equal(resolveProjectPlatform(cwd), null);
+    fs.writeFileSync(path.join(cwd, 'PRODUCT.md'), '# App\n\nno platform field\n');
+    assert.equal(resolveProjectPlatform(cwd), null);
+  });
+
+  it('isNativePlatform is true only for ios / android / adaptive', () => {
+    assert.equal(isNativePlatform('ios'), true);
+    assert.equal(isNativePlatform('android'), true);
+    assert.equal(isNativePlatform('adaptive'), true);
+    assert.equal(isNativePlatform('web'), false);
+    assert.equal(isNativePlatform(null), false);
+  });
+});
+
 describe('Cursor hook scripts', () => {
   let cwd;
   beforeEach(() => { cwd = mkTmp(); });
@@ -1814,6 +2795,33 @@ describe('Cursor hook scripts', () => {
     assert.equal(entries[0].blockedFindings, 1);
   });
 
+  it('preToolUse allows writes with findings when the project platform is native', () => {
+    // Same slop content the deny test blocks, but the project declares a
+    // native platform, so the web rule engine must stand aside.
+    fs.writeFileSync(path.join(cwd, 'PRODUCT.md'), '# App\n\n## Platform\n\nios\n');
+    const out = execFileSync(process.execPath, [path.join('skill', 'scripts', 'hook-before-edit.mjs')], {
+      cwd: path.resolve('.'),
+      input: JSON.stringify({
+        hook_event_name: 'preToolUse',
+        cwd,
+        tool_name: 'Write',
+        tool_input: {
+          file_path: path.join(cwd, 'src/Card.html'),
+          content: `
+            <style>
+              .card { border-left: 4px solid #7c3aed; border-radius: 16px; }
+            </style>
+            <div class="card">Hello</div>
+          `,
+        },
+      }),
+      env: { ...process.env, IMPECCABLE_HOOK_LOG: '' },
+      encoding: 'utf-8',
+    });
+
+    assert.deepEqual(JSON.parse(out), { permission: 'allow' });
+  });
+
   it('preToolUse allows clean proposed writes', () => {
     const out = execFileSync(process.execPath, [path.join('skill', 'scripts', 'hook-before-edit.mjs')], {
       cwd: path.resolve('.'),
@@ -1831,6 +2839,70 @@ describe('Cursor hook scripts', () => {
     });
 
     assert.deepEqual(JSON.parse(out), { permission: 'allow' });
+  });
+
+  it('preToolUse gates configured template extensions (issue #316)', () => {
+    const filePath = path.join(cwd, 'resources/views/card.blade.php');
+    const content = `
+      <style>
+        .card { border-left: 4px solid #7c3aed; border-radius: 16px; }
+      </style>
+      <div class="card">Hello</div>
+    `;
+    const run = () => execFileSync(process.execPath, [path.join('skill', 'scripts', 'hook-before-edit.mjs')], {
+      cwd: path.resolve('.'),
+      input: JSON.stringify({
+        hook_event_name: 'preToolUse',
+        cwd,
+        tool_name: 'Write',
+        tool_input: { file_path: filePath, content },
+      }),
+      env: { ...process.env, IMPECCABLE_HOOK_LOG: '' },
+      encoding: 'utf-8',
+    });
+
+    // Without config the file is invisible to the gate: allowed untouched.
+    assert.equal(JSON.parse(run()).permission, 'allow');
+
+    // With a detector.extensions entry the same proposed write is scanned and denied.
+    fs.mkdirSync(path.join(cwd, '.impeccable'), { recursive: true });
+    fs.writeFileSync(path.join(cwd, '.impeccable', 'config.json'), JSON.stringify({
+      detector: { extensions: [{ ext: '.blade.php' }] },
+    }));
+    const payload = JSON.parse(run());
+    assert.equal(payload.permission, 'deny');
+    assert.match(payload.user_message, /card\.blade\.php/);
+    assert.match(payload.user_message, /side-tab/);
+  });
+
+  it('preToolUse routes configured html-engine templates through the HTML engine (issue #316)', () => {
+    // oversized-h1 is only detectable by the static HTML engine (detectText has
+    // no such rule), so a denial here proves the proposed content went through
+    // detectHtml rather than the old always-detectText path.
+    const filePath = path.join(cwd, 'resources/views/hero.blade.php');
+    fs.mkdirSync(path.join(cwd, '.impeccable'), { recursive: true });
+    fs.writeFileSync(path.join(cwd, '.impeccable', 'config.json'), JSON.stringify({
+      detector: { extensions: [{ ext: '.blade.php' }] },
+    }));
+
+    const out = execFileSync(process.execPath, [path.join('skill', 'scripts', 'hook-before-edit.mjs')], {
+      cwd: path.resolve('.'),
+      input: JSON.stringify({
+        hook_event_name: 'preToolUse',
+        cwd,
+        tool_name: 'Write',
+        tool_input: {
+          file_path: filePath,
+          content: '<style>h1 { font-size: 84px; }</style>\n<h1>This is a very long headline that keeps going on and on for a while</h1>',
+        },
+      }),
+      env: { ...process.env, IMPECCABLE_HOOK_LOG: '' },
+      encoding: 'utf-8',
+    });
+
+    const payload = JSON.parse(out);
+    assert.equal(payload.permission, 'deny');
+    assert.match(payload.user_message, /oversized-h1/);
   });
 
   it('preToolUse denies shell heredoc writes that bypass the Write tool', () => {
@@ -2065,7 +3137,7 @@ describe('runHook() — emission enrichment', () => {
   }
 
   it('returns emission.kind fresh with findings on new hits', async () => {
-    write('src/styles.css', "body { font-family: 'Inter', sans-serif; }");
+    write('src/styles.css', 'h1 { background-clip: text; color: transparent; }');
     const r = await runHook({
       stdinJson: JSON.stringify({
         session_id: 'emit-fresh',
@@ -2075,10 +3147,311 @@ describe('runHook() — emission enrichment', () => {
       }),
       env: { IMPECCABLE_HOOK_HARNESS: 'claude' },
       cwd,
-      detector: fakeDetector([finding('overused-font', 8)]),
+      detector: fakeDetector([finding('gradient-text', 8)]),
     });
     assert.equal(r.emission?.kind, 'fresh');
     assert.ok(Array.isArray(r.emission?.findings));
     assert.equal(r.emission.findings.length, 1);
+  });
+});
+
+describe('runHook() — per-edit tiering', () => {
+  // The per-edit pass surfaces only IMMEDIATE_TIER_RULES; everything else is
+  // deferred to the Stop deep pass. See hook-lib.mjs for the tier rationale.
+  let cwd;
+  beforeEach(() => { cwd = mkTmp(); });
+  afterEach(() => fs.rmSync(cwd, { recursive: true, force: true }));
+
+  function eventFor(file, sessionId = 'tier-sid') {
+    return {
+      session_id: sessionId,
+      cwd,
+      hook_event_name: 'PostToolUse',
+      tool_name: 'Edit',
+      tool_input: { file_path: file },
+    };
+  }
+
+  function write(rel, body) {
+    const abs = path.join(cwd, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, body);
+    return abs;
+  }
+
+  it('splitFindingsByTier partitions on IMMEDIATE_TIER_RULES', () => {
+    const { immediate, deferred } = splitFindingsByTier([
+      finding('dark-glow', 1),
+      finding('marketing-buzzword', 2),
+      finding('low-contrast', 3),
+      finding('side-tab', 4),
+    ]);
+    assert.deepEqual(immediate.map((f) => f.antipattern), ['dark-glow', 'low-contrast']);
+    assert.deepEqual(deferred.map((f) => f.antipattern), ['marketing-buzzword', 'side-tab']);
+    for (const f of immediate) assert.ok(IMMEDIATE_TIER_RULES.has(f.antipattern));
+  });
+
+  it('perEditTieringActive is on for claude, off for cursor/github and perEditRules:"all"', () => {
+    assert.equal(perEditTieringActive({ perEditRules: 'immediate' }, 'claude'), true);
+    assert.equal(perEditTieringActive({ perEditRules: 'all' }, 'claude'), false);
+    assert.equal(perEditTieringActive({ perEditRules: 'immediate' }, 'github'), false);
+    assert.equal(perEditTieringActive({ perEditRules: 'immediate' }, 'cursor'), false);
+    assert.equal(perEditTieringActive({}, 'claude'), true);
+  });
+
+  it('surfaces immediate-tier findings per edit and defers copy-tier ones', async () => {
+    const file = write('src/Card.tsx', 'noop');
+    const det = fakeDetector([
+      finding('marketing-buzzword', 3),
+      finding('dark-glow', 5),
+    ]);
+    const r = await runHook({ stdinJson: JSON.stringify(eventFor(file)), env: {}, cwd, detector: det });
+    assert.match(r.stdout, /Design hook findings requiring review/);
+    assert.match(r.stdout, /dark-glow/);
+    assert.doesNotMatch(r.stdout, /marketing-buzzword/);
+    assert.equal(r.audit.deferred, 1);
+
+    const cache = readCache(cwd);
+    assert.deepEqual(cache.sessions['tier-sid'].files[file].findings, ['dark-glow:5']);
+  });
+
+  it('emits a clean ack when all findings are deferred, and still marks the file touched', async () => {
+    const file = write('src/Copy.tsx', 'noop');
+    const det = fakeDetector([finding('marketing-buzzword', 2)]);
+    const r = await runHook({ stdinJson: JSON.stringify(eventFor(file, 'tier-deferred-only')), env: {}, cwd, detector: det });
+    assert.match(r.stdout, /No deterministic design-quality issues found/);
+    assert.doesNotMatch(r.stdout, /marketing-buzzword/);
+    assert.equal(r.audit.deferred, 1);
+
+    // The touched-file entry is what lets the Stop deep pass find this file.
+    const cache = readCache(cwd);
+    assert.ok(cache.sessions['tier-deferred-only'].files[file], 'file should be marked touched');
+    assert.deepEqual(cache.sessions['tier-deferred-only'].files[file].findings || [], []);
+  });
+
+  it('config hook.perEditRules:"all" restores the full per-edit rule set', async () => {
+    fs.mkdirSync(path.join(cwd, '.impeccable'), { recursive: true });
+    fs.writeFileSync(getConfigPath(cwd), JSON.stringify({ hook: { perEditRules: 'all' } }));
+    const file = write('src/Card.tsx', 'noop');
+    const det = fakeDetector([finding('marketing-buzzword', 2)]);
+    const r = await runHook({ stdinJson: JSON.stringify(eventFor(file, 'tier-all')), env: {}, cwd, detector: det });
+    assert.match(r.stdout, /Design hook findings requiring review/);
+    assert.match(r.stdout, /marketing-buzzword/);
+    assert.equal(r.audit.deferred, undefined);
+  });
+
+  it('github harness keeps the full rule set per edit (no Stop pass wired there)', async () => {
+    const file = write('src/Card.tsx', 'noop');
+    const githubEvent = {
+      sessionId: 'gh-tier',
+      cwd,
+      toolName: 'edit',
+      toolArgs: JSON.stringify({ path: file }),
+    };
+    const det = fakeDetector([finding('marketing-buzzword', 2)]);
+    const r = await runHook({ stdinJson: JSON.stringify(githubEvent), env: {}, cwd, detector: det });
+    assert.equal(r.audit.harness, 'github');
+    const out = JSON.parse(r.stdout);
+    assert.match(out.additionalContext, /marketing-buzzword/);
+  });
+
+  it('skips advisory findings per edit by default and never nags about them', async () => {
+    const file = write('src/Copy.tsx', 'noop');
+    const det = fakeDetector([finding('em-dash-overuse', 3)]);
+    const r = await runHook({ stdinJson: JSON.stringify(eventFor(file, 'adv-skip')), env: {}, cwd, detector: det });
+    // The only finding is advisory, so the file scans clean.
+    assert.match(r.stdout, /No deterministic design-quality issues found/);
+    assert.doesNotMatch(r.stdout, /em-dash-overuse/);
+  });
+
+  it('includes advisory findings per edit when detector.advisoryRules is "include"', async () => {
+    fs.mkdirSync(path.join(cwd, '.impeccable'), { recursive: true });
+    fs.writeFileSync(getConfigPath(cwd), JSON.stringify({
+      hook: { perEditRules: 'all' },
+      detector: { advisoryRules: 'include' },
+    }));
+    const file = write('src/Copy.tsx', 'noop');
+    const det = fakeDetector([finding('em-dash-overuse', 3)]);
+    const r = await runHook({ stdinJson: JSON.stringify(eventFor(file, 'adv-include')), env: {}, cwd, detector: det });
+    assert.match(r.stdout, /Design hook findings requiring review/);
+    assert.match(r.stdout, /em-dash-overuse/);
+  });
+});
+
+describe('runStopHook()', () => {
+  let cwd;
+  beforeEach(() => { cwd = mkTmp(); });
+  afterEach(() => fs.rmSync(cwd, { recursive: true, force: true }));
+
+  function write(rel, body) {
+    const abs = path.join(cwd, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, body);
+    return abs;
+  }
+
+  function editEvent(file, sessionId) {
+    return {
+      session_id: sessionId,
+      cwd,
+      hook_event_name: 'PostToolUse',
+      tool_name: 'Edit',
+      tool_input: { file_path: file },
+    };
+  }
+
+  function stopEvent(sessionId) {
+    return {
+      session_id: sessionId,
+      cwd,
+      hook_event_name: 'Stop',
+      stop_hook_active: false,
+    };
+  }
+
+  it('runs the full rule set over touched files and dedupes per-edit-surfaced findings', async () => {
+    const sid = 'stop-sid';
+    const file = write('src/Card.tsx', 'noop');
+    const det = fakeDetector([
+      finding('dark-glow', 5),
+      finding('marketing-buzzword', 3),
+      finding('side-tab', 7),
+    ]);
+
+    // Per-edit pass: surfaces dark-glow, defers the other two.
+    const edit = await runHook({ stdinJson: JSON.stringify(editEvent(file, sid)), env: {}, cwd, detector: det });
+    assert.match(edit.stdout, /dark-glow/);
+    assert.doesNotMatch(edit.stdout, /marketing-buzzword/);
+
+    // Stop deep pass: surfaces exactly the deferred remainder.
+    const stop = await runStopHook({ stdinJson: JSON.stringify(stopEvent(sid)), env: {}, cwd, detector: det });
+    assert.equal(stop.exitCode, 0);
+    assert.equal(stop.audit.emitted, true);
+    const out = JSON.parse(stop.stdout);
+    assert.equal(out.hookSpecificOutput.hookEventName, 'Stop');
+    assert.match(out.hookSpecificOutput.additionalContext, /marketing-buzzword/);
+    assert.match(out.hookSpecificOutput.additionalContext, /side-tab/);
+    assert.doesNotMatch(out.hookSpecificOutput.additionalContext, /dark-glow/);
+    assert.equal(stop.emission.kind, 'stop-deep-pass');
+  });
+
+  it('exits silent and fast when the session touched no UI files', async () => {
+    const r = await runStopHook({ stdinJson: JSON.stringify(stopEvent('stop-untouched')), env: {}, cwd });
+    assert.equal(r.exitCode, 0);
+    assert.equal(r.stdout, '');
+    assert.equal(r.audit.skipped, 'no-touched-files');
+  });
+
+  it('a second Stop fire is silent: deep-pass findings are remembered', async () => {
+    const sid = 'stop-twice';
+    const file = write('src/Card.tsx', 'noop');
+    const det = fakeDetector([finding('marketing-buzzword', 3)]);
+
+    await runHook({ stdinJson: JSON.stringify(editEvent(file, sid)), env: {}, cwd, detector: det });
+    const first = await runStopHook({ stdinJson: JSON.stringify(stopEvent(sid)), env: {}, cwd, detector: det });
+    assert.match(first.stdout, /marketing-buzzword/);
+
+    const second = await runStopHook({ stdinJson: JSON.stringify(stopEvent(sid)), env: {}, cwd, detector: det });
+    assert.equal(second.stdout, '');
+    assert.equal(second.audit.skipped, 'stop-clean');
+  });
+
+  it('stays silent when detector.ignoreRules filters away every touched finding', async () => {
+    const sid = 'stop-ignored';
+    fs.mkdirSync(path.join(cwd, '.impeccable'), { recursive: true });
+    fs.writeFileSync(getConfigPath(cwd), JSON.stringify({
+      detector: { ignoreRules: ['marketing-buzzword'] },
+    }));
+    const file = write('src/Card.tsx', 'noop');
+    const det = fakeDetector([finding('marketing-buzzword', 3)]);
+
+    await runHook({ stdinJson: JSON.stringify(editEvent(file, sid)), env: {}, cwd, detector: det });
+    const stop = await runStopHook({ stdinJson: JSON.stringify(stopEvent(sid)), env: {}, cwd, detector: det });
+    assert.equal(stop.stdout, '');
+    assert.equal(stop.audit.skipped, 'stop-clean');
+  });
+
+  it('skips advisory findings in the deep pass by default', async () => {
+    const sid = 'stop-advisory';
+    const file = write('src/Card.tsx', 'noop');
+    const det = fakeDetector([finding('em-dash-overuse', 3)]);
+
+    await runHook({ stdinJson: JSON.stringify(editEvent(file, sid)), env: {}, cwd, detector: det });
+    const stop = await runStopHook({ stdinJson: JSON.stringify(stopEvent(sid)), env: {}, cwd, detector: det });
+    // Silent either way: the advisory finding is dropped at the per-edit pass, so
+    // the file is never recorded as touched, and the deep pass has nothing to say.
+    assert.equal(stop.stdout, '');
+    assert.ok(['stop-clean', 'no-touched-files'].includes(stop.audit.skipped));
+  });
+
+  it('surfaces advisory findings in the deep pass when advisoryRules is "include"', async () => {
+    const sid = 'stop-advisory-include';
+    fs.mkdirSync(path.join(cwd, '.impeccable'), { recursive: true });
+    fs.writeFileSync(getConfigPath(cwd), JSON.stringify({
+      detector: { advisoryRules: 'include' },
+    }));
+    const file = write('src/Card.tsx', 'noop');
+    const det = fakeDetector([finding('em-dash-overuse', 3)]);
+
+    await runHook({ stdinJson: JSON.stringify(editEvent(file, sid)), env: {}, cwd, detector: det });
+    const stop = await runStopHook({ stdinJson: JSON.stringify(stopEvent(sid)), env: {}, cwd, detector: det });
+    assert.equal(stop.audit.emitted, true);
+    const out = JSON.parse(stop.stdout);
+    assert.match(out.hookSpecificOutput.additionalContext, /em-dash-overuse/);
+  });
+
+  it('re-invoked with stop_hook_active:true exits 0 and silent even with pending findings (issue #400)', async () => {
+    const sid = 'stop-active';
+    const file = write('src/Card.tsx', 'noop');
+    const det = fakeDetector([finding('marketing-buzzword', 3)]);
+
+    // Prime a real touched-file + finding so a plain Stop pass would fire.
+    await runHook({ stdinJson: JSON.stringify(editEvent(file, sid)), env: {}, cwd, detector: det });
+
+    // Re-invocation after the previous fire kept the turn alive: the contract
+    // says exit clean, no re-block, before scanning.
+    const active = { ...stopEvent(sid), stop_hook_active: true };
+    const stop = await runStopHook({ stdinJson: JSON.stringify(active), env: {}, cwd, detector: det });
+    assert.equal(stop.exitCode, 0);
+    assert.equal(stop.stdout, '');
+    assert.equal(stop.audit.emitted, undefined);
+    assert.equal(stop.audit.skipped, 'stop-hook-active');
+  });
+
+  it('stop_hook_active:false or absent still runs the deep pass as before', async () => {
+    const sid = 'stop-inactive';
+    const file = write('src/Card.tsx', 'noop');
+    const det = fakeDetector([finding('marketing-buzzword', 3)]);
+    await runHook({ stdinJson: JSON.stringify(editEvent(file, sid)), env: {}, cwd, detector: det });
+
+    // Explicit false (the stopEvent default).
+    const explicitFalse = await runStopHook({ stdinJson: JSON.stringify(stopEvent(sid)), env: {}, cwd, detector: det });
+    assert.equal(explicitFalse.audit.emitted, true);
+    assert.match(explicitFalse.stdout, /marketing-buzzword/);
+
+    // Field absent entirely (legacy / non-Claude-Code payloads): same behavior.
+    const sid2 = 'stop-absent';
+    const file2 = write('src/Card2.tsx', 'noop');
+    await runHook({ stdinJson: JSON.stringify(editEvent(file2, sid2)), env: {}, cwd, detector: det });
+    const ev = stopEvent(sid2);
+    delete ev.stop_hook_active;
+    const absent = await runStopHook({ stdinJson: JSON.stringify(ev), env: {}, cwd, detector: det });
+    assert.equal(absent.audit.emitted, true);
+    assert.match(absent.stdout, /marketing-buzzword/);
+  });
+
+  it('honors kill switches and the re-entrancy guard', async () => {
+    const disabled = await runStopHook({
+      stdinJson: JSON.stringify(stopEvent('stop-killed')),
+      env: { IMPECCABLE_HOOK_DISABLED: '1' }, cwd,
+    });
+    assert.equal(disabled.audit.skipped, 'env-disabled');
+
+    const reentrant = await runStopHook({
+      stdinJson: JSON.stringify(stopEvent('stop-reentrant')),
+      env: { IMPECCABLE_HOOK_DEPTH: '1' }, cwd,
+    });
+    assert.equal(reentrant.audit.reentrant, true);
+    assert.equal(reentrant.stdout, '');
   });
 });

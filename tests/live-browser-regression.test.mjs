@@ -74,7 +74,7 @@ describe('live-browser.js regression guards', () => {
     );
   });
 
-  it('uses a Svelte-gated painted-ancestor crop proxy for shader capture', () => {
+  it('uses a framework-component-gated painted-ancestor crop proxy for shader capture', () => {
     assert.match(
       SOURCE,
       /function findShaderProxyCaptureRoot\(el\) \{[\s\S]{0,500}?let node = el\.parentElement;[\s\S]{0,700}?containsElement && paintsShaderProxySurface\(node\)[\s\S]{0,120}?return null;/,
@@ -87,8 +87,8 @@ describe('live-browser.js regression guards', () => {
     );
     assert.match(
       SOURCE,
-      /function shouldUseAncestorCropShaderProxy\(el\) \{[\s\S]{0,260}?window\.__IMPECCABLE_LIVE_ADAPTER__[\s\S]{0,280}?currentPreviewMode === 'svelte-component' \|\| svelteComponentSession[\s\S]{0,260}?dataset\?\.impeccablePreview === 'svelte-component';/,
-      'ancestor crop proxy must be gated to the Svelte adapter / Svelte component previews',
+      /function shouldUseAncestorCropShaderProxy\(el\) \{[\s\S]{0,260}?window\.__IMPECCABLE_LIVE_ADAPTER__[\s\S]{0,280}?isFrameworkComponentPreviewMode\(currentPreviewMode\) \|\| svelteComponentSession[\s\S]{0,260}?isFrameworkComponentPreviewMode\(wrapper\?\.dataset\?\.impeccablePreview\);/,
+      'ancestor crop proxy must be gated to Svelte/Vue component previews',
     );
     assert.match(
       SOURCE,
@@ -141,9 +141,28 @@ describe('live-browser.js regression guards', () => {
   it('restores unsaved inline edit drafts before hideBar tears editing down', () => {
     assert.match(
       SOURCE,
-      /function hideBar\(\) \{[\s\S]{0,620}?if \(state === 'EDITING'\) restoreInlineEditDrafts\(\);[\s\S]{0,80}?disableInlineEdit\(\);/,
+      /function hideBar\(instant\) \{[\s\S]{0,720}?if \(state === 'EDITING'\) restoreInlineEditDrafts\(\);[\s\S]{0,80}?disableInlineEdit\(\);/,
       'hideBar should not leave unsaved contenteditable drafts in the DOM when an external event hides the bar',
     );
+  });
+
+  it('discards variants without hiding the original or animating stale chrome', () => {
+    assert.match(SOURCE, /function showOriginalDuringDiscard\(sessionId\)[\s\S]{0,900}?data-impeccable-variant="original"/);
+    assert.match(SOURCE, /function handleDiscard\(\)[\s\S]{0,420}?cleanup\(\{ restoreOriginal: true, instantChrome: true \}\)/);
+    assert.match(SOURCE, /if \(instant\) barEl\.style\.display = 'none'/);
+    assert.match(
+      SOURCE,
+      /if \(restoreOriginal\) showOriginalDuringDiscard\(cleanupSessionId\);\s*else wrapper\.style\.display = 'none';/,
+      'only non-discard cleanup may blank the wrapper while waiting for HMR',
+    );
+  });
+
+  it('stores live state off the document root and preserves the selected anchor top', () => {
+    assert.match(SOURCE, /window\.__IMPECCABLE_LIVE_STATE__ = next/);
+    assert.doesNotMatch(SOURCE, /document\.documentElement\.dataset\.impeccableLiveState/);
+    assert.match(SOURCE, /pickedAnchorViewportTop: Number\.isFinite\(pickedAnchorViewportTop\)/);
+    assert.match(SOURCE, /scrollLockAnchorTop = typeof initialAnchorTop === 'number' && isFinite\(initialAnchorTop\)/);
+    assert.match(SOURCE, /const anchorDelta = anchorTop - scrollLockAnchorTop/);
   });
 
   it('does not autofocus the steering chat while inline editing', () => {
@@ -267,6 +286,41 @@ describe('live-browser.js regression guards', () => {
     );
   });
 
+  it('server-lost toast frames the disconnect as resumable, not ended', () => {
+    assert.doesNotMatch(
+      SOURCE,
+      /Live server disconnected\. Session ended\./,
+      'the "Session ended" copy made agents rationalize bailing to direct edits; the session is resumable',
+    );
+    assert.match(
+      SOURCE,
+      /Live server connection lost\. Your session is saved;[^']*restart live-poll\.mjs to continue\./,
+      'server-lost toast should tell the user the session is saved and how to continue',
+    );
+  });
+
+  it('the agent-phase progress bar advances monotonically', () => {
+    // A behind/resumed checkpoint must not move the visible bar backward.
+    assert.doesNotMatch(
+      SOURCE,
+      /generationPhase = msg\.phase \|\| generationPhase;/,
+      'raw phase assignment lets a behind checkpoint regress the visible bar to an earlier phase',
+    );
+    assert.match(
+      SOURCE,
+      /case 'agent_phase':[\s\S]{0,400}?if \(shouldAdvancePhase\(generationPhase, msg\.phase\)\) generationPhase = msg\.phase;/,
+      'agent_phase should only advance the phase when it moves forward',
+    );
+    // The rank table must order the lifecycle so scaffolding/source_ready sit
+    // below generating and the reviewable phases.
+    assert.match(SOURCE, /function shouldAdvancePhase\(current, next\)/);
+    assert.match(
+      SOURCE,
+      /scaffolding: 2,[\s\S]{0,120}?source_ready: 4,[\s\S]{0,120}?(generation_ready|generating): 5,/,
+      'scaffolding and source_ready must rank below generating',
+    );
+  });
+
   it('source reinjection preserves the visible variant after cycling', () => {
     assert.doesNotMatch(
       SOURCE,
@@ -315,6 +369,65 @@ describe('live-browser.js regression guards', () => {
       SOURCE,
       /scrollLockAbort\.signal\.addEventListener\('abort', \(\) => \{\s*document\.getElementById\(SCROLL_ANCHOR_LOCK_ID\)\?\.remove\(\);/,
       'stopping the scroll lock must remove the injected anchor-suppression <style> so it never outlives the session',
+    );
+  });
+
+  it('drives variant visibility and --p-* params through a stylesheet, not inline SSR element mutation', () => {
+    // Variant divs live in page source, so Next.js App Router server-renders
+    // them. Toggling hidden/style.display/--p-* on those nodes client-side
+    // makes React 19 report a hydration mismatch on the next Fast-Refresh
+    // re-render — the same failure mode as scroll-anchor (#276) and pick-cursor
+    // (#286). Visibility and range/toggle custom properties must go through an
+    // injected <style> rule instead.
+    assert.doesNotMatch(
+      SOURCE,
+      /function setVariantShown\(/,
+      'event=live_browser.variant_visibility_hydration actor=browser operation=show_variant_in_dom risk=react19_hydration_mismatch_on_next_app_router expected=stylesheet_rule actual=hidden_and_inline_display_on_variant_div',
+    );
+    assert.match(
+      SOURCE,
+      /if \(svelteComponentSession\?\.sessionId === currentSessionId\)[\s\S]{0,280}?variantEl\.style\.setProperty\('--p-'/,
+      'client-mounted Svelte component variants drive --p-* inline (no SSR div, no hydration), unlike server-rendered variant divs',
+    );
+    assert.match(
+      SOURCE,
+      /function applyParamValue\([\s\S]{0,1200}?svelteComponentSession\?\.sessionId === currentSessionId[\s\S]{0,400}?return;[\s\S]{0,400}?updateVariantStateStylesheet\(currentSessionId, visibleVariant\)/,
+      'applyParamValue must short-circuit the Svelte inline path before the SSR stylesheet path',
+    );
+    assert.match(
+      SOURCE,
+      /const VARIANT_STATE_STYLE_ID = 'impeccable-variant-state';/,
+      'the variant-state style needs a stable id constant so it can be created and removed by id',
+    );
+    assert.match(
+      SOURCE,
+      /const VARIANT_HIDE_DECL = 'display: none !important;';/,
+      'the hidden-variant rule should be a named constant for readability',
+    );
+    assert.match(
+      SOURCE,
+      /function updateVariantStateStylesheet\(sessionId, num\)[\s\S]{0,500}?createElement\('style'\)[\s\S]{0,500}?VARIANT_HIDE_DECL/,
+      'variant cycling must hide non-visible variants with an injected <style> rule keyed by VARIANT_STATE_STYLE_ID',
+    );
+    assert.match(
+      SOURCE,
+      /function removeVariantStateStylesheet\(\)[\s\S]{0,120}?document\.getElementById\(VARIANT_STATE_STYLE_ID\)\?\.remove\(\)/,
+      'leaving CYCLING or tearing down live mode must remove the injected variant-state <style>',
+    );
+    assert.doesNotMatch(
+      SOURCE,
+      /function refreshParamsPanel\(\)[\s\S]{0,220}?if \(state !== 'CYCLING'\)[\s\S]{0,220}?removeVariantStateStylesheet\(\)/,
+      'refreshParamsPanel must not strip the variant-state sheet during GENERATING first-reveal',
+    );
+    assert.match(
+      SOURCE,
+      /function refreshParamsPanel\(\)[\s\S]{0,600}?if \(!variantEl \|\| params\.length === 0\)[\s\S]{0,220}?updateVariantStateStylesheet\(currentSessionId, visibleVariant\)/,
+      'paramless variant switches must re-sync the variant-state sheet to clear stale --p-* params',
+    );
+    assert.match(
+      SOURCE,
+      /function isVariantShown\(el\)[\s\S]{0,120}?getComputedStyle\(el\)\.display/,
+      'visible-variant detection must read computed display, not el.hidden or el.style.display',
     );
   });
 
@@ -381,8 +494,32 @@ describe('live-browser.js regression guards', () => {
     );
     assert.match(
       SOURCE,
+      /function buildSteerProcessingDots\(\)[\s\S]{0,500}?justifyContent: 'flex-end'[\s\S]{0,220}?marginLeft: 'auto'/,
+      'steer processing dots should stay aligned to the input trailing edge',
+    );
+    assert.match(
+      SOURCE,
       /function syncAgentPollingUi\(/,
       'global bar brand must reflect agent poll connectivity',
+    );
+    // The indicator goes quiet both when nobody is polling and when the agent
+    // holds leased work. Under one-shot foreground polling the second case is
+    // every normal generation, so a single "run live-poll.mjs to connect" tip
+    // told users to fix a healthy session.
+    assert.match(
+      SOURCE,
+      /function agentHasWorkInFlight\(\)\s*\{\s*return state === 'GENERATING' \|\| state === 'SAVING';/,
+      'agent poll copy must distinguish a busy agent from an absent one',
+    );
+    assert.match(
+      SOURCE,
+      /agentHasWorkInFlight\(\) \? AGENT_BUSY_TIP : AGENT_DISCONNECTED_TIP/,
+      'a busy agent must not be described as disconnected',
+    );
+    assert.match(
+      SOURCE,
+      /tip\.textContent = agentStatusText\(\)/,
+      'tooltip copy must be derived at display time, not read from a cache the 5s status poll last wrote',
     );
     assert.match(
       SOURCE,
@@ -528,6 +665,34 @@ describe('live-browser.js regression guards', () => {
     );
   });
 
+  it('toast enter and dismiss timers only touch the current toast element', () => {
+    assert.match(
+      SOURCE,
+      /function showToast\(message, duration\)[\s\S]{0,1200}?const currentToast = el\('div'/,
+      'showToast must capture the created toast in a local so delayed callbacks cannot dereference or remove a stale global toastEl',
+    );
+    assert.match(
+      SOURCE,
+      /requestAnimationFrame\(\(\) => \{[\s\S]{0,80}?if \(toastEl !== currentToast\) return;[\s\S]{0,120}?currentToast\.style\.opacity = '1';/,
+      'toast enter rAF must no-op when dismissToast or a newer toast replaced toastEl before the frame fires',
+    );
+    assert.match(
+      SOURCE,
+      /setTimeout\(\(\) => \{[\s\S]{0,80}?if \(toastEl !== currentToast\) return;[\s\S]{0,120}?currentToast\.style\.opacity = '0';/,
+      'toast auto-dismiss timer must not animate a newer toast created after this timer was scheduled',
+    );
+    assert.match(
+      SOURCE,
+      /setTimeout\(\(\) => \{[\s\S]{0,80}?if \(toastEl !== currentToast\) return;[\s\S]{0,80}?currentToast\.remove\(\);[\s\S]{0,80}?toastEl = null;/,
+      'toast removal timer must only remove and clear the same toast it scheduled',
+    );
+    assert.doesNotMatch(
+      SOURCE,
+      /requestAnimationFrame\(\(\) => \{\s*toastEl\.style/,
+      'toast enter rAF must not read toastEl.style directly after dismissToast can null it',
+    );
+  });
+
   it('insert mode UI and generate payload guards', () => {
     assert.match(SOURCE, /function toggleInsert\(\)/, 'global bar must expose insert toggle');
     assert.match(SOURCE, /PREFIX \+ '-insert-toggle'/, 'insert toggle needs stable id');
@@ -632,8 +797,8 @@ describe('live-browser.js regression guards', () => {
     );
     assert.match(
       SOURCE,
-      /function setVariantShown\(el, shown\)[\s\S]{0,200}?removeAttribute\('hidden'\)/,
-      'variant cycling must clear the hidden attribute, not only style.display',
+      /function updateVariantStateStylesheet\(sessionId, num\)[\s\S]{0,900}?VARIANT_HIDE_DECL/,
+      'variant cycling must hide non-visible variants via injected stylesheet, not hidden/style.display on SSR divs',
     );
     assert.match(
       SOURCE,
@@ -754,6 +919,61 @@ describe('live-browser.js regression guards', () => {
     );
   });
 
+  it('makes every arrived progressive variant immediately actionable', () => {
+    assert.match(
+      SOURCE,
+      /if \(arrivedVariants > 0\) \{[\s\S]{0,180}?setLiveState\('CYCLING'\)/,
+      'the first arrived variant should leave the generating-only state',
+    );
+    assert.doesNotMatch(
+      SOURCE,
+      /arrivedVariants < expectedVariants\) \{[\s\S]{0,180}?accept\.style\.pointerEvents = 'none'/,
+      'Accept must not wait for variants the user did not choose',
+    );
+    assert.doesNotMatch(
+      SOURCE,
+      /arrivedVariants < expectedVariants\) \{[\s\S]{0,180}?discard\.style\.pointerEvents = 'none'/,
+      'Discard must cancel remaining work immediately',
+    );
+    assert.match(
+      SOURCE,
+      /const resumedState = arrivedVariants > 0 \? 'CYCLING' : 'GENERATING'/,
+      'reload recovery should preserve a partially delivered review state',
+    );
+    assert.match(
+      SOURCE,
+      /arrivedVariants >= expectedVariants && expectedVariants > 0[\s\S]{0,100}?\? 'variants_ready'[\s\S]{0,60}?: 'variants_progress'/,
+      'checkpoint timing must distinguish partial review from complete delivery by counts',
+    );
+  });
+
+  it('keeps deferred Tune controls visible and refreshes params-only publications', () => {
+    assert.match(
+      SOURCE,
+      /const paramsPending = !hasParams && \(parameterGenerationState === 'pending' \|\| parameterGenerationState === 'loading'\)/,
+      'the cycling bar must expose Tune while parameter generation is outstanding',
+    );
+    assert.match(SOURCE, /tune\.disabled = true/, 'pending Tune must be visibly loading but non-interactive');
+    assert.match(SOURCE, /Tune controls are ready\./, 'parameter arrival needs a clear ready indication');
+    // Source-mode DOM injection is gated to the `done` branch (it races
+    // framework ownership mid-generation), but a params-only publication must
+    // still flip the Tune controls into their loading state on the checkpoint.
+    assert.match(
+      SOURCE,
+      /case 'variant_progress':[\s\S]{0,120}?if \(msg\.publicationKind === 'params'\) parameterGenerationState = 'loading';/,
+      'a params-only publication must mark Tune controls loading even though the variant count is unchanged',
+    );
+    assert.match(SOURCE, /revisionDomain: 'browser'/, 'browser checkpoints must use their own revision domain');
+  });
+
+  it('promotes an early-accepted Svelte preview before releasing the picker', () => {
+    assert.match(
+      SOURCE,
+      /function scheduleAcceptCleanup\(accepted\) \{[\s\S]{0,420}?if \(accepted\?\.isSvelteComponent\) \{[\s\S]{0,120}?commitAcceptedSvelteComponentToDom\(accepted\.id\);[\s\S]{0,120}?cleanupAcceptedSession\(\);/,
+      'Svelte early accept must tear down its adapter mount before the next picking session starts',
+    );
+  });
+
   it('variant injection resolves the picked anchor before entering recovery', () => {
     assert.match(
       SOURCE,
@@ -769,6 +989,29 @@ describe('live-browser.js regression guards', () => {
       SOURCE,
       /showToast\('Variants ready\. Reveal the selected element to resume\.'/,
       'recovery chrome already shows this message in the generating bar; a duplicate toast stacks two bars',
+    );
+  });
+
+  it('uses dark ink for every control filled with kinpaku gold in the Tune drawer', () => {
+    assert.match(
+      SOURCE,
+      /background: tuneOpen \? C\.brand : BP\.hairline,[\s\S]{0,100}?color: tuneOpen \? C\.ink : 'inherit'/,
+      'the active Tune count badge needs dark ink on gold',
+    );
+    assert.match(
+      SOURCE,
+      /background: active \? C\.brand : 'transparent',[\s\S]{0,100}?color: active \? C\.ink : P\.text/,
+      'active segmented options need dark ink on gold',
+    );
+    assert.match(
+      SOURCE,
+      /btn\.style\.background = on \? C\.brand : 'transparent';\s*btn\.style\.color = on \? C\.ink : P\.text;/,
+      'segmented options must keep dark ink after interaction',
+    );
+    assert.match(
+      SOURCE,
+      /const knob = el\('span',[\s\S]{0,300}?background: C\.ink/,
+      'the toggle knob needs a visible dark edge against gold',
     );
   });
 
