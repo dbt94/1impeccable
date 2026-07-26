@@ -86,6 +86,74 @@ describe('detectText - Astro structural CSS fixtures', () => {
   });
 });
 
+describe('detectText — pseudo-element stripe fixtures (issue #394)', () => {
+  // The side-tab silhouette drawn as an absolutely-positioned ::before/::after
+  // bar instead of a border. The scanner already ran on full HTML pages via
+  // checkHtmlPatterns; these pin the standalone-stylesheet and component
+  // style-block paths, which used to pass this construction clean.
+  const SHOULD_FLAG = [
+    'Inset Shorthand Left Edge',
+    'Longhand Left Edge',
+    'Bottom Edge',
+    'Full Height Right Edge',
+  ];
+  const SHOULD_PASS = [
+    'Neutral Divider',
+    'Wide Panel',
+    'Static Underline',
+    'Hairline Divider',
+    'Hover Underline',
+    'Floating Badge',
+    // Commented-out CSS is not a live rule.
+    'Commented Out Stripe',
+  ];
+
+  // The 1-based line a case's selector sits on in a fixture file, so the
+  // reported finding line can be checked against the actual source.
+  const selectorLine = (source, caseName) => {
+    const idx = source.split('\n').findIndex(l => l.includes(`data-case="${caseName}"`));
+    assert.notEqual(idx, -1, `fixture is missing case "${caseName}"`);
+    return idx + 1;
+  };
+
+  it('standalone .css files flag chromatic pseudo-element stripes only', () => {
+    const filePath = path.join(FIXTURES, 'pseudo-stripe.css');
+    const source = fs.readFileSync(filePath, 'utf8');
+    const findings = detectText(source, filePath).filter(r => r.antipattern === 'side-tab');
+    const snippets = findings.map(r => r.snippet || '').join(' | ');
+    for (const heading of SHOULD_FLAG) {
+      assert.match(snippets, new RegExp(`data-case=${JSON.stringify(heading)}`), `expected "${heading}" to flag`);
+    }
+    for (const heading of SHOULD_PASS) {
+      assert.doesNotMatch(snippets, new RegExp(`data-case=${JSON.stringify(heading)}`), `"${heading}" should pass`);
+    }
+    // Every finding must carry the selector's real source line, so
+    // line-scoped inline ignores (impeccable-disable-line and
+    // impeccable-disable-next-line) can match it.
+    for (const f of findings) {
+      const caseName = (f.snippet.match(/data-case="([^"]+)"/) || [])[1];
+      assert.equal(
+        f.line, selectorLine(source, caseName),
+        `finding for "${caseName}" reports line ${f.line}, selector sits on line ${selectorLine(source, caseName)}`,
+      );
+    }
+  });
+
+  it('component style blocks flag pseudo-element stripes at their source line', () => {
+    const filePath = path.join(FIXTURES, 'pseudo-stripe.vue');
+    const source = fs.readFileSync(filePath, 'utf8');
+    const findings = detectText(source, filePath).filter(r => r.antipattern === 'side-tab');
+    const snippets = findings.map(r => r.snippet || '').join(' | ');
+    assert.match(snippets, /data-case="Component Left Edge"/, 'expected the component stripe to flag');
+    assert.doesNotMatch(snippets, /data-case="Component Neutral Divider"/, 'neutral divider should pass');
+    const stripe = findings.find(r => /data-case="Component Left Edge"/.test(r.snippet || ''));
+    assert.equal(
+      stripe.line, selectorLine(source, 'Component Left Edge'),
+      'style-block finding must map back to the whole-file line, not the block-local one',
+    );
+  });
+});
+
 describe('detectHtml — static HTML/CSS fixtures', () => {
   it('should-flag: catches border anti-patterns', async () => {
     const f = await detectHtml(path.join(FIXTURES, 'should-flag.html'));
@@ -359,6 +427,42 @@ describe('detectHtml — static HTML/CSS fixtures', () => {
     // pass cases (neutral-resolving var, thin var, uniform all-sides var).
     // If any leaks through, the label exception or var() fallback is
     // over-broad.
+    const borderAccent = f.filter(r => r.antipattern === 'border-accent-on-rounded');
+    assert.equal(
+      borderAccent.length, 0,
+      `expected 0 border-accent-on-rounded, got ${borderAccent.length}: ${borderAccent.map(r => r.snippet).join('; ')}`
+    );
+  });
+
+  it('named-color-borders: named-color side-tabs are flagged, neutral names pass', async () => {
+    // Regression for issue #359: the static cascade's shorthand color
+    // extraction recognized only 9 named colors, so `border-left: 4px solid
+    // purple` (or any of the other named colors parseAnyColor understands)
+    // lost its color during expansion, defaulted to neutral black, and never
+    // fired side-tab — while the same declaration in a .css file was flagged
+    // by the regex engine. The extraction list is now derived from the same
+    // CSS_NAMED_COLORS table the parser uses, so the two can't drift apart.
+    const f = await detectHtml(path.join(FIXTURES, 'named-color-borders.html'));
+    const sideTabs = f.filter(r => r.antipattern === 'side-tab').map(r => r.snippet).sort();
+    // Six FLAG cases, each with a unique width/radius signature so every
+    // finding attributes to exactly one case (an offsetting miss + false
+    // positive can't cancel out in an aggregate count):
+    //   purple 4px + radius 8 (the issue reproducer), rebeccapurple 5px +
+    //   radius 4 (contains "purple" as a substring — whole-token matching),
+    //   crimson 4px top stripe, bare 3px teal, var() resolving to a named
+    //   color at 6px + radius 4, and a 7px inline style attribute.
+    // The PASS column (neutral named colors at 3-4px, 1px thin, uniform)
+    // must contribute nothing — dimgray/gainsboro/black have to parse AND
+    // read as neutral rather than being dropped as unknown colors, and none
+    // of its shapes can produce any of the signatures below.
+    assert.deepEqual(sideTabs, [
+      'border-left: 3px',
+      'border-left: 4px + border-radius: 8px',
+      'border-left: 5px + border-radius: 4px',
+      'border-left: 6px + border-radius: 4px',
+      'border-left: 7px',
+      'border-top: 4px',
+    ]);
     const borderAccent = f.filter(r => r.antipattern === 'border-accent-on-rounded');
     assert.equal(
       borderAccent.length, 0,
